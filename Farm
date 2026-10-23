@@ -1,4 +1,4 @@
---[[ Auto Farm • Drip Menu — by Angel — v3 (menu único, sem abas) — com carregador seguro
+--[[ Auto Farm • Drip Menu — by Angel — v4 (menu único, sem abas) — com carregador seguro
      Se algo falhar, o erro aparece numa caixa vermelha na tela E é copiado para a área de transferência.
      Os números de linha do erro se referem ao código interno (linha 1 = primeira linha após o início do bloco SRC). ]]
 
@@ -24,7 +24,7 @@ local SRC = [==[
 --[[
 	Auto Farm • Drip Menu — by Angel
 	Missões: lixo (pegar/guardar), grama (compra foice + corta), caixa (pega/entrega),
-	"Ambos" (lixo + grama) e "Todos" (lixo + grama + caixa).
+	"Ambos" (lixo + grama) e "Todos" (3 lixos -> 4 gramas -> 1 caixa).
 	Teleporte + instant interact nativo (HoldDuration = 0 só localmente; restaurado ao parar).
 	Por sua conta e risco: pode violar as regras do jogo/Roblox.
 ]]
@@ -38,6 +38,7 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return end
 
@@ -45,18 +46,21 @@ if not LocalPlayer then return end
 -- CONFIG
 ----------------------------------------------------------------------
 local CFG = {
-	SLICE = 30, -- segundos por módulo no modo "Ambos"/"Todos" (termina o item carregado antes de trocar)
 	-- Posição (HumanoidRootPart) registrada DENTRO da área de entrega da caixa. Ajuste aqui se precisar.
 	DELIVERY = Vector3.new(440.63, 3.85, -223.15),
 	DELIVERY_OFFSETS = { Vector3.new(0, 0, 0), Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2) },
+	BOX_SKIP_SECS = 12,   -- no modo misto, quantos segundos pular a caixa quando ela está em cooldown
+	NOTICE_MAX = 2,       -- máx. de avisos de cooldown por cooldown (zera quando a ação dá certo)
+	NOTICE_GAP = 6,       -- intervalo mínimo (s) entre dois avisos do mesmo tipo
 }
 local JOBS = { lixo = "Recolher Lixo", grama = "Cortar Grama", caixa = "Caixas" }
 local MISSIONS = {
 	{ label = "Recolher lixo", mods = { "lixo" } },
 	{ label = "Cortar grama", mods = { "grama" } },
-	{ label = "Ambos (grama e lixo)", mods = { "lixo", "grama" } },
+	{ label = "Ambos (grama e lixo)", mods = { "lixo", "grama" }, quota = { lixo = 1, grama = 1 } },
 	{ label = "Entregar Caixa", mods = { "caixa" } },
-	{ label = "Todos", mods = { "lixo", "grama", "caixa" } },
+	-- Todos: começa com 3 lixos, depois 4 gramas, depois 1 caixa, e repete
+	{ label = "Todos", mods = { "lixo", "grama", "caixa" }, quota = { lixo = 3, grama = 4, caixa = 1 } },
 }
 local C = {
 	bg = Color3.fromRGB(13, 13, 16), panel = Color3.fromRGB(20, 21, 26), card = Color3.fromRGB(27, 28, 35),
@@ -108,7 +112,8 @@ end
 -- Workspace.Map.Sistemas.Jobs.Caixas (prompt "Pegar") -> Tool "Caixa" -> entrega na área marcada
 ----------------------------------------------------------------------
 local Farm = {
-	running = false, mods = {}, t0 = 0, action = "parado", black = {},
+	running = false, mods = {}, quota = {}, idx = 1, done = 0, fails = 0, curMod = nil, lastNotifT = 0, buyMsg = nil,
+	action = "parado", note = nil, noteMod = nil, notified = {}, black = {}, skipUntil = {},
 	stats = { coletados = 0, depositados = 0, cortadas = 0, caixas = 0 },
 }
 do
@@ -128,13 +133,22 @@ local function farmRoot()
 	local c = LocalPlayer.Character
 	return c and c:FindFirstChild("HumanoidRootPart")
 end
+-- procura a Tool pelo nome exato; se não achar, aceita nome que contenha o texto (ex.: "Foice Enferrujada")
 local function findTool(name)
-	local c = LocalPlayer.Character
-	local t = c and c:FindFirstChild(name)
-	if t and t:IsA("Tool") then return t, true end
-	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
-	t = bp and bp:FindFirstChild(name)
-	if t and t:IsA("Tool") then return t, false end
+	local low = name:lower()
+	local function scan(container)
+		if not container then return nil end
+		local exact = container:FindFirstChild(name)
+		if exact and exact:IsA("Tool") then return exact end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and t.Name:lower():find(low, 1, true) then return t end
+		end
+		return nil
+	end
+	local t = scan(LocalPlayer.Character)
+	if t then return t, true end
+	t = scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+	if t then return t, false end
 	return nil, false
 end
 local function moneyStr()
@@ -212,6 +226,7 @@ local function nearest(list, from)
 end
 -- teleporta, aciona e confirma (≈0.5s); true se confirmou
 local function interact(p, doneFn, alive)
+	local t0 = os.clock()
 	teleportTo(posOf(p))
 	task.wait(0.08)
 	triggerPrompt(p)
@@ -220,9 +235,28 @@ local function interact(p, doneFn, alive)
 		triggerFallback(p)
 		done = waitFor(doneFn, 0.3, alive)
 	end
+	-- falhou e o jogo mostrou uma notificação durante a tentativa = provável cooldown
+	if not done and alive() and Farm.lastNotifT >= t0 - 0.2 then Farm.notify(Farm.curMod) end
 	return done
 end
 
+----------------------------------------------------------------------
+-- AVISO DE COOLDOWN (igual para lixo, grama e caixa)
+-- No máximo NOTICE_MAX avisos por cooldown; o contador zera quando a ação do tipo dá certo.
+----------------------------------------------------------------------
+function Farm.notify(kind)
+	if not kind then return end
+	local s = Farm.notified[kind]
+	if not s then s = { n = 0, t = -100 }; Farm.notified[kind] = s end
+	local now = os.clock()
+	if s.n >= CFG.NOTICE_MAX or now - s.t < CFG.NOTICE_GAP then return end
+	s.n += 1
+	s.t = now
+	if Farm.onNotify then pcall(Farm.onNotify, kind) end
+end
+function Farm.resetNotify(kind)
+	if kind then Farm.notified[kind] = nil end
+end
 function Farm.restoreHold()
 	for p, v in pairs(originalHold) do pcall(function() p.HoldDuration = v end) end
 	for p, v in pairs(originalLOS) do pcall(function() p.RequiresLineOfSight = v end) end
@@ -237,22 +271,30 @@ function Farm.stop()
 end
 
 -- LIXO
+local function unavailable(msg)
+	Farm.action = msg
+	if #Farm.mods > 1 then return false end -- em modo misto, pula para o próximo módulo
+	task.wait(0.5)
+	return true
+end
 local function trashStep(job, hrp, alive)
 	if findTool("Lixo") then
 		local bin = nearest(collectPrompts(job:FindFirstChild("Lixeiras"), false), hrp.Position)
-		if not bin then Farm.action = "sem lixeira disponível"; task.wait(0.5) return true end
+		if not bin then return unavailable("sem lixeira disponível") end
 		Farm.action = "guardando lixo"
 		if interact(bin, function() return findTool("Lixo") == nil end, alive) then
 			Farm.stats.depositados += 1
+			Farm.resetNotify("lixo")
 		else
 			Farm.black[bin] = os.clock() + 2
 		end
 	else
 		local pr = nearest(collectPrompts(job:FindFirstChild("Lixos"), true), hrp.Position)
-		if not pr then Farm.action = "procurando lixo ativo"; task.wait(0.5) return true end
+		if not pr then return unavailable("procurando lixo ativo") end
 		Farm.action = "pegando lixo"
 		if interact(pr, function() return findTool("Lixo") ~= nil end, alive) then
 			Farm.stats.coletados += 1
+			Farm.resetNotify("lixo")
 		else
 			Farm.black[pr] = os.clock() + 5
 		end
@@ -261,27 +303,91 @@ local function trashStep(job, hrp, alive)
 end
 
 -- GRAMA (compra a foice se não tiver)
-local function ensureFoice(job, alive)
-	if findTool("Foice") then return true end
-	if os.clock() < noBuyUntil then Farm.action = "sem foice (compra falhou)"; return false end
+local MULT = { K = 1e3, M = 1e6, B = 1e9 }
+-- converte "2500", "2.500", "2,500", "2.5K", "1M" em número (nunca dá erro)
+local function parseAmount(s)
+	if type(s) == "number" then return s end
+	if s == nil then return nil end
+	s = tostring(s):upper()
+	local num, suf = s:match("([%d%.,]+)%s*([KMB]?)")
+	if not num then return nil end
+	if suf == "" then
+		num = num:gsub("[%.,]", "") -- sem sufixo: pontos/vírgulas são separador de milhar
+	else
+		num = num:gsub(",", ".")
+	end
+	local n = tonumber(num)
+	if not n then return nil end
+	return n * (MULT[suf] or 1)
+end
+local function parseMoney()
+	local ls = LocalPlayer:FindFirstChild("leaderstats")
+	local v = ls and ls:FindFirstChild("Dinheiro")
+	if not v then return nil end
+	return parseAmount(v.Value)
+end
+local function shopPrice(pr)
+	for _, s in ipairs({ tostring(pr.ActionText), tostring(pr.ObjectText) }) do
+		local after = s:match("%$%s*([%d%.,]+%s*[KkMmBb]?)")
+		local before = s:match("([%d%.,]+%s*[KkMmBb]?)%s*%$")
+		local v = parseAmount(after or before)
+		if v and v > 0 then return v end
+	end
+	return nil
+end
+local function findShopPrompt(job)
 	local shop = job:FindFirstChild("Foice")
 	local pr = shop and shop:FindFirstChildWhichIsA("ProximityPrompt", true)
-	if not pr then Farm.action = "loja da foice não encontrada"; noBuyUntil = os.clock() + 10; return false end
+	if pr then return pr end
+	for _, d in ipairs(job:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and (tostring(d.ObjectText):find("Foice") or tostring(d.ActionText):find("Comprar")) then return d end
+	end
+	return nil
+end
+local function buyFail(msg, secs)
+	noBuyUntil = os.clock() + (secs or 20)
+	Farm.buyMsg = msg
+	Farm.action = msg
+	return false
+end
+local function ensureFoice(job, alive)
+	if findTool("Foice") then return true end
+	if os.clock() < noBuyUntil then Farm.action = Farm.buyMsg or "sem foice"; return false end
+	local pr = findShopPrompt(job)
+	if not pr then return buyFail("loja da foice não encontrada", 10) end
+	local price = shopPrice(pr)
+	local money = parseMoney()
+	-- só bloqueia se souber o preço E o dinheiro; caso contrário tenta comprar mesmo assim
+	if price and money and money + 100 < price then
+		return buyFail("sem dinheiro p/ foice (" .. math.floor(price) .. "$)", 15)
+	end
 	Farm.action = "comprando foice"
-	local done = interact(pr, function() return findTool("Foice") ~= nil end, alive)
-	if not done then
-		task.wait(0.3)
-		done = findTool("Foice") ~= nil
+	local function got() return findTool("Foice") ~= nil end
+	local function goShop() teleportTo(posOf(pr)); task.wait(0.12) end
+	-- 1) instantâneo (2 tentativas)
+	for _ = 1, 2 do
+		goShop()
+		triggerPrompt(pr)
+		if waitFor(got, 0.9, alive) then return true end
+		if not alive() then return false end
 	end
-	if not done and alive() then
-		noBuyUntil = os.clock() + 20
-		Farm.action = "foice não comprada (dinheiro?)"
-		return false
-	end
-	return done
+	-- 2) hold real (caso o servidor exija o tempo de hold)
+	local hold = originalHold[pr] or 1
+	pcall(function() pr.HoldDuration = hold end)
+	goShop()
+	task.spawn(function()
+		pcall(function() pr:InputHoldBegin(); task.wait(hold + 0.15); pr:InputHoldEnd() end)
+	end)
+	local ok = waitFor(got, hold + 1.5, alive)
+	pcall(function() pr.HoldDuration = 0 end)
+	if ok then return true end
+	if not alive() then return false end
+	return buyFail("foice não comprada (sem resposta do servidor)", 20)
 end
 local function grassStep(job, hrp, alive)
-	if not ensureFoice(job, alive) then return false end
+	local okB, res = pcall(ensureFoice, job, alive)
+	if not okB then return buyFail("erro na compra: " .. short(res, 40), 10) end
+	if not res then return false end
 	local tool, equipped = findTool("Foice")
 	if tool and not equipped then
 		Farm.action = "equipando foice"
@@ -290,28 +396,35 @@ local function grassStep(job, hrp, alive)
 		task.wait(0.15)
 	end
 	local pr = nearest(collectPrompts(job:FindFirstChild("Gramas"), true), hrp.Position)
-	if not pr then Farm.action = "procurando grama ativa"; task.wait(0.5) return true end
+	if not pr then return unavailable("procurando grama ativa") end
 	Farm.action = "cortando grama"
 	local part = pr.Parent
 	local function cut()
 		return not pr:IsDescendantOf(Workspace) or part:GetAttribute("Ativo") == false or part.Transparency >= 1
 	end
-	if interact(pr, cut, alive) then Farm.stats.cortadas += 1 else Farm.black[pr] = os.clock() + 5 end
+	if interact(pr, cut, alive) then
+		Farm.stats.cortadas += 1
+		Farm.resetNotify("grama")
+	else
+		Farm.black[pr] = os.clock() + 5
+	end
 	return true
 end
 
 -- CAIXA (pega no prompt e entrega na área marcada)
 local function deliverBox(alive)
-	local m0 = moneyStr()
+	local m0, t0 = moneyStr(), os.clock()
 	for _, off in ipairs(CFG.DELIVERY_OFFSETS) do
 		if not alive() then return end
 		Farm.action = "entregando caixa"
 		teleportTo(CFG.DELIVERY + off, 0)
 		if waitFor(function() return findTool("Caixa") == nil or moneyStr() ~= m0 end, 0.5, alive) then
 			Farm.stats.caixas += 1
+			Farm.resetNotify("caixa")
 			return
 		end
 	end
+	if alive() and Farm.lastNotifT >= t0 - 0.2 then Farm.notify("caixa") end
 	Farm.action = "entrega não confirmada"
 	task.wait(1)
 end
@@ -321,10 +434,17 @@ local function boxStep(job, hrp, alive)
 		return true
 	end
 	local pr = nearest(collectPrompts(job, false), hrp.Position)
-	if not pr then Farm.action = "aguardando caixa"; task.wait(0.5) return true end
+	if not pr then return unavailable("aguardando caixa (cooldown)") end
 	Farm.action = "pegando caixa"
-	if not interact(pr, function() return findTool("Caixa") ~= nil end, alive) then
+	if interact(pr, function() return findTool("Caixa") ~= nil end, alive) then
+		Farm.resetNotify("caixa")
+	else
 		Farm.black[pr] = os.clock() + 2
+		-- no modo misto não fica preso na caixa: segue para o próximo
+		if #Farm.mods > 1 then
+			Farm.action = "caixa em cooldown"
+			return false
+		end
 	end
 	return true
 end
@@ -334,30 +454,99 @@ local function has(mod)
 	return false
 end
 local function runMod(mod, hrp, alive)
+	Farm.curMod = mod
 	local job = jobFolder(mod)
 	if not job then Farm.action = "trabalho '" .. JOBS[mod] .. "' não encontrado"; return false end
 	if mod == "lixo" then return trashStep(job, hrp, alive) end
 	if mod == "grama" then return grassStep(job, hrp, alive) end
 	return boxStep(job, hrp, alive)
 end
+local function unitOf(mod)
+	if mod == "lixo" then return Farm.stats.depositados end
+	if mod == "grama" then return Farm.stats.cortadas end
+	return Farm.stats.caixas
+end
+-- avança para o próximo módulo que não esteja em "pausa" (ex.: caixa em cooldown)
+local function nextMod()
+	local n, now = #Farm.mods, os.clock()
+	local i = Farm.idx
+	for _ = 1, n do
+		i = i % n + 1
+		if not ((Farm.skipUntil[Farm.mods[i]] or 0) > now) then break end
+	end
+	Farm.idx = i
+	Farm.done = 0
+end
+-- Revezamento por cota: "Todos" = 3 lixos -> 4 gramas -> 1 caixa -> repete
 local function farmStep(gen)
 	local function alive() return Farm.running and farmGen == gen end
 	local hrp = farmRoot()
 	if not hrp then Farm.action = "aguardando personagem"; task.wait(0.5) return end
 	local mods = Farm.mods
-	local mod
+	local cur = mods[Farm.idx]
+	-- módulo em pausa (caixa em cooldown): pula direto, a não ser que já esteja carregando a caixa
+	if #mods > 1 and (Farm.skipUntil[cur] or 0) > os.clock() and not (cur == "caixa" and findTool("Caixa")) then
+		nextMod()
+		cur = mods[Farm.idx]
+	end
+	local mod = cur
 	if has("lixo") and findTool("Lixo") then mod = "lixo"
-	elseif has("caixa") and findTool("Caixa") then mod = "caixa"
-	elseif #mods == 1 then mod = mods[1]
-	else mod = mods[math.floor((os.clock() - Farm.t0) / CFG.SLICE) % #mods + 1] end
-	if runMod(mod, hrp, alive) == false then
-		for _, o in ipairs(mods) do
-			if o ~= mod and runMod(o, hrp, alive) ~= false then return end
+	elseif has("caixa") and findTool("Caixa") then mod = "caixa" end
+	local before = unitOf(mod)
+	local ok = runMod(mod, hrp, alive)
+	if ok == false then
+		Farm.note, Farm.noteMod = Farm.action, mod
+		if #mods > 1 then
+			Farm.skipUntil[mod] = os.clock() + (mod == "caixa" and CFG.BOX_SKIP_SECS or 2)
+			if mod == cur then nextMod() end
+			Farm.fails += 1
+			if Farm.fails >= #mods then Farm.fails = 0; task.wait(1) else task.wait(0.1) end
+		else
+			task.wait(1)
 		end
-		task.wait(1)
+		return
+	end
+	Farm.fails = 0
+	if Farm.noteMod == mod then Farm.note, Farm.noteMod = nil, nil end
+	if mod == "caixa" then Farm.skipUntil.caixa = nil end
+	if mod == cur and unitOf(mod) > before then
+		Farm.done += 1
+		if Farm.done >= (Farm.quota[cur] or 1) then nextMod() end
 	end
 end
-function Farm.start(mods)
+
+-- Detecção das notificações do jogo (qualquer RemoteEvent de aviso/notificação)
+local COOLDOWN_WORDS = { "cooldown", "coldown", "cool down", "aguard", "espere", "espera", "tempo", "segundo",
+	"recarreg", "calma", "devagar", "rápido", "rapido", "wait", "delay", "ainda não", "ainda nao" }
+local function collectStrings(v, out, depth)
+	if type(v) == "string" then
+		out[#out + 1] = v:lower()
+	elseif type(v) == "table" and depth < 3 then
+		for _, x in pairs(v) do collectStrings(x, out, depth + 1) end
+	end
+end
+local function kindOfText(text)
+	if text:find("caixa", 1, true) or text:find("entrega", 1, true) then return "caixa" end
+	if text:find("lixo", 1, true) or text:find("lixeira", 1, true) then return "lixo" end
+	if text:find("grama", 1, true) or text:find("foice", 1, true) or text:find("cort", 1, true) then return "grama" end
+	return Farm.curMod
+end
+local function onGameNotice(...)
+	Farm.lastNotifT = os.clock()
+	pcall(function()
+		local parts = {}
+		for _, a in ipairs({ ... }) do collectStrings(a, parts, 0) end
+		local text = table.concat(parts, " ")
+		for _, w in ipairs(COOLDOWN_WORDS) do
+			if text:find(w, 1, true) then
+				Farm.notify(kindOfText(text))
+				return
+			end
+		end
+	end)
+end
+
+function Farm.start(mods, quota)
 	if Farm.running then return false, "Farm já está ativo." end
 	for _, m in ipairs(mods) do
 		if not jobFolder(m) then return false, "Trabalho '" .. JOBS[m] .. "' não encontrado no mapa." end
@@ -366,13 +555,28 @@ function Farm.start(mods)
 	local gen = farmGen
 	Farm.running = true
 	Farm.mods = mods
-	Farm.t0 = os.clock()
+	Farm.quota = quota or {}
+	Farm.idx, Farm.done, Farm.fails = 1, 0, 0
+	Farm.note, Farm.noteMod, Farm.notified, Farm.buyMsg, Farm.curMod = nil, nil, {}, nil, nil
+	Farm.lastNotifT = 0
 	Farm.stats = { coletados = 0, depositados = 0, cortadas = 0, caixas = 0 }
 	Farm.black = {}
+	Farm.skipUntil = {}
 	Farm.action = "iniciando"
 	noBuyUntil = 0
 	farmMaid:clean()
 	for _, m in ipairs(mods) do enableInstant(jobFolder(m)) end
+	pcall(function()
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			if d:IsA("RemoteEvent") then
+				local n = d.Name:lower()
+				if n:find("notif", 1, true) or n:find("aviso", 1, true) or n:find("alert", 1, true)
+					or n:find("mensag", 1, true) or n:find("message", 1, true) then
+					farmMaid:add(d.OnClientEvent:Connect(onGameNotice))
+				end
+			end
+		end
+	end)
 	task.spawn(function()
 		while Farm.running and farmGen == gen do
 			local ok, err = pcall(farmStep, gen)
@@ -417,7 +621,7 @@ local gui = mk("ScreenGui", { Name = "DripMenu" .. math.random(10000, 99999), Re
 local VIEW = viewport()
 local W = math.min(200, math.max(180, VIEW.X - 16))
 local HH, H = 28, 128
-local main = mk("Frame", { Name = "Main", Size = UDim2.fromOffset(W, H), Position = UDim2.fromOffset(math.max(8, (VIEW.X - W) / 2), 12),
+local main = mk("Frame", { Name = "Main", Size = UDim2.fromOffset(W, H), Position = UDim2.fromOffset(math.max(8, (VIEW.X - W) / 2), math.max(8, (VIEW.Y - H) / 2)),
 	BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true }, gui)
 corner(main, 10); stroke(main)
 
@@ -492,6 +696,39 @@ local list = mk("Frame", { Position = UDim2.fromOffset(10, HH + 8 + 28), Size = 
 	BackgroundColor3 = C.panel, BorderSizePixel = 0, Visible = false, ZIndex = 10 }, main)
 corner(list, 7); stroke(list, C.accent)
 
+-- Notificação de cooldown (preta com gradiente roxo; some em 5.5s) — igual para lixo, grama e caixa
+local NOTES = {
+	caixa = "A entrega de Caixa tem cooldown, então aguarde.",
+	lixo = "A coleta de lixo tem cooldown, então aguarde.",
+	grama = "O corte de grama tem cooldown, então aguarde.",
+}
+local notice = mk("Frame", { Name = "Notice", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -100), Size = UDim2.fromOffset(250, 58),
+	BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Visible = false, ZIndex = 100 }, gui)
+corner(notice, 10)
+mk("UIGradient", { Rotation = 25, Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 6, 14)), ColorSequenceKeypoint.new(0.55, Color3.fromRGB(34, 16, 66)), ColorSequenceKeypoint.new(1, Color3.fromRGB(96, 44, 170)) }) }, notice)
+stroke(notice, Color3.fromRGB(150, 100, 255))
+mk("TextLabel", { Position = UDim2.fromOffset(14, 7), Size = UDim2.new(1, -28, 0, 16), BackgroundTransparency = 1, Text = "Cooldown", TextColor3 = Color3.fromRGB(196, 160, 255),
+	TextSize = 13, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 101 }, notice)
+local noticeText = mk("TextLabel", { Position = UDim2.fromOffset(14, 25), Size = UDim2.new(1, -28, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = C.text,
+	TextSize = 11, Font = Enum.Font.Gotham, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 101 }, notice)
+local noticeToken = 0
+Farm.onNotify = function(kind)
+	noticeToken += 1
+	local my = noticeToken
+	noticeText.Text = NOTES[kind] or NOTES.caixa
+	notice.Position = UDim2.new(0.5, 0, 0, -100)
+	notice.Visible = true
+	TweenService:Create(notice, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 24) }):Play()
+	task.delay(5, function()
+		if noticeToken ~= my then return end
+		TweenService:Create(notice, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, 0, 0, -100) }):Play()
+	end)
+	task.delay(5.5, function()
+		if noticeToken == my and notice.Parent then notice.Visible = false end
+	end)
+end
+
 local mission = 1
 local function say(text, color) statusLabel.Text = text; statusLabel.TextColor3 = color or C.muted end
 
@@ -503,7 +740,7 @@ local function refresh()
 			elseif m == "grama" then parts[#parts + 1] = "grama " .. Farm.stats.cortadas
 			else parts[#parts + 1] = "caixas " .. Farm.stats.caixas end
 		end
-		say("● " .. Farm.action .. "\n" .. table.concat(parts, " • "), C.green)
+		say("● " .. Farm.action .. "\n" .. (Farm.note and ("! " .. Farm.note) or table.concat(parts, " • ")), Farm.note and C.amber or C.green)
 		startBtn.BackgroundColor3 = C.btn; stopBtn.BackgroundColor3 = C.stopOn
 	else
 		startBtn.BackgroundColor3 = C.startOn; stopBtn.BackgroundColor3 = C.btn
@@ -552,7 +789,7 @@ local function startTicker()
 end
 uiMaid:add(startBtn.Activated:Connect(function()
 	list.Visible = false
-	local ok, msg = Farm.start(MISSIONS[mission].mods)
+	local ok, msg = Farm.start(MISSIONS[mission].mods, MISSIONS[mission].quota)
 	if ok then startTicker() else say(msg, C.amber) end
 	refresh()
 end))
