@@ -69,12 +69,13 @@ local PROPERTY_TYPES = { atributo = true, valor = true, leaderstat = true, propr
 local CATS = {
 	coleta = { label = "Pegar lixo" }, deposito = { label = "Guardar lixo" },
 	foice = { label = "Comprar foice" }, grama = { label = "Cortar grama" },
+	pegar_caixa = { label = "Pegar caixa" }, entregar_caixa = { label = "Entregar caixa" },
 }
-local CAT_MOD = { coleta = "lixo", deposito = "lixo", foice = "grama", grama = "grama" }
+local CAT_MOD = { coleta = "lixo", deposito = "lixo", foice = "grama", grama = "grama", pegar_caixa = "caixa", entregar_caixa = "caixa" }
 local MODULES = {
 	lixo = { label = "Lixo (auto farm)", available = true },
-	grama = { label = "Grama (comprar foice/cortar)", available = true },
-	caixa = { label = "Caixa", available = false },
+	grama = { label = "Grama (auto farm)", available = true },
+	caixa = { label = "Caixa (pegar/entregar)", available = true },
 }
 local MISSIONS = {
 	{ label = "Recolher lixo", mods = { "lixo" } },
@@ -729,7 +730,7 @@ local function finalize(s)
 		local id = string.format("E%03d", e.n)
 		if e.tipo == "prompt_acionado" then
 			once("pa", id .. ": o jogador acionou um ProximityPrompt (" .. oname(e) .. "). O processamento provavelmente ocorre no servidor; não confirmado.")
-		elseif (e.tipo == "personagem_adic" or e.tipo == "mochila_adic") and rec.categoria == "coleta" then
+		elseif (e.tipo == "personagem_adic" or e.tipo == "mochila_adic") and (rec.categoria == "coleta" or rec.categoria == "pegar_caixa") then
 			once("add", id .. ": '" .. oname(e) .. "' passou a ficar com o personagem/mochila — compatível com coleta; não confirmado.")
 		elseif (e.tipo == "personagem_rem" or e.tipo == "mochila_rem") and rec.categoria == "deposito" then
 			once("rem", id .. ": '" .. oname(e) .. "' deixou o personagem/mochila — compatível com depósito; não confirmado.")
@@ -815,21 +816,152 @@ function Recorder.abort()
 end
 
 ----------------------------------------------------------------------
--- [4b] AUTO FARM DE LIXO (teleporte + instant interact nativo)
+-- [4a] DETECTOR DE ÁREA DE ENTREGA (um único toque)
+-- Lê o que está sob/ao redor do personagem e registra posição, tamanho e
+-- orientação exatos das peças candidatas. Não move o personagem.
+----------------------------------------------------------------------
+local ZONE_WORDS = { "entreg", "deliver", "dropoff", "drop", "zona", "zone", "area", "área", "marc", "caixa", "box", "objetivo", "target", "finish", "destin" }
+local function p2(v) return string.format("(%.2f, %.2f, %.2f)", v.X, v.Y, v.Z) end
+
+local function detectDeliveryZone(missao)
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil, "Personagem não encontrado." end
+	local pos = hrp.Position
+	local feet = pos - Vector3.new(0, 3, 0)
+	local ev = {}
+	local function addEv(tipo, desc, ref, dados)
+		local d
+		if dados then d = {}; for k, v in pairs(dados) do d[clean(k)] = cleanPrim(v) end end
+		ev[#ev + 1] = { n = #ev + 1, t = 0, tipo = tipo, desc = trunc(desc, CFG.STR), ref = ref, dados = d }
+	end
+	local antes = snapshot()
+	addEv("sessao", "Detecção de área de entrega iniciada (toque único)", nil, { posicaoJogador = p2(pos) })
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+	local okP, parts = pcall(function() return Workspace:GetPartBoundsInRadius(pos, 14, params) end)
+	if not okP or type(parts) ~= "table" then parts = {} end
+	local rparams = RaycastParams.new()
+	rparams.FilterType = Enum.RaycastFilterType.Exclude
+	rparams.FilterDescendantsInstances = { char }
+	local okR, hit = pcall(function() return Workspace:Raycast(pos, Vector3.new(0, -25, 0), rparams) end)
+	local floorPart = okR and hit and hit.Instance or nil
+
+	local cand, seen = {}, {}
+	local function consider(part, isFloor)
+		if seen[part] or not part:IsA("BasePart") then return end
+		seen[part] = true
+		local size = part.Size
+		local touch = false
+		pcall(function() touch = part:FindFirstChildOfClass("TouchTransmitter") ~= nil end)
+		if math.max(size.X, size.Y, size.Z) > 250 and not touch and not isFloor then return end
+		local rel = part.CFrame:PointToObjectSpace(feet)
+		local inside = math.abs(rel.X) <= size.X / 2 + 0.05 and math.abs(rel.Z) <= size.Z / 2 + 0.05 and math.abs(rel.Y) <= size.Y / 2 + 5
+		local lname = (part.Name .. " " .. (part.Parent and part.Parent.Name or "")):lower()
+		local sc, why, nameHit = 0, {}, false
+		for _, w in ipairs(ZONE_WORDS) do
+			if lname:find(w, 1, true) then sc += 3; nameHit = true; why[#why + 1] = "nome~" .. w; break end
+		end
+		if touch then sc += 4; why[#why + 1] = "TouchInterest" end
+		if not part.CanCollide then sc += 2; why[#why + 1] = "CanCollide=false" end
+		if part.Transparency >= 0.3 then sc += 1; why[#why + 1] = "semi-transparente" end
+		if math.min(size.X, size.Y, size.Z) <= 1.5 then sc += 1; why[#why + 1] = "peça fina" end
+		local at = attrStr(part)
+		if at ~= "" then sc += 1; why[#why + 1] = "tem atributos" end
+		if inside then sc += 4; why[#why + 1] = "jogador dentro" end
+		if isFloor then why[#why + 1] = "peça sob os pés" end
+		if sc == 0 and not isFloor then return end
+		local dist = (part.Position - pos).Magnitude
+		cand[#cand + 1] = { part = part, score = sc, why = why, inside = inside, touch = touch, nameHit = nameHit, floor = isFloor, dist = dist, attrs = at }
+	end
+	if floorPart then consider(floorPart, true) end
+	for _, p in ipairs(parts) do consider(p, p == floorPart) end
+	table.sort(cand, function(a, b)
+		if a.score ~= b.score then return a.score > b.score end
+		return a.dist < b.dist
+	end)
+	while #cand > 8 do table.remove(cand) end
+
+	local objetos, best = {}, nil
+	for i, c in ipairs(cand) do
+		local part = c.part
+		local ref = string.format("OBJ-%03d", i)
+		local extra = string.format("Centro=%s; Tamanho=%s; Orientacao=%s; CanCollide=%s; CanTouch=%s; TouchInterest=%s; Transparencia=%s; Pontos=%d; Motivos=%s",
+			p2(part.Position), p2(part.Size), p2(part.Orientation), tostring(part.CanCollide), tostring(part.CanTouch), tostring(c.touch),
+			tostring(cleanPrim(part.Transparency)), c.score, table.concat(c.why, ","))
+		objetos[#objetos + 1] = {
+			ref = ref, nome = clean(part.Name), classe = part.ClassName, caminho = pathOf(part), posicao = v3str(part.Position),
+			distancia = string.format("%.1f", c.dist), atributos = (c.attrs ~= "" and (c.attrs .. "; ") or "") .. extra, eventos = 1,
+		}
+		c.ref = ref
+		if not best and c.inside and (c.touch or c.nameHit or not part.CanCollide) then best = c end
+	end
+	if not best and cand[1] then best = cand[1] end
+
+	addEv("estado", "Jogador em " .. p2(pos) .. " (pés ~ " .. p2(feet) .. ")", nil)
+	addEv("estado", floorPart and ("Peça sob os pés: " .. clean(floorPart.Name) .. " (" .. floorPart.ClassName .. ")") or "Nenhuma peça sob os pés (raycast)", nil)
+	for _, c in ipairs(cand) do
+		local part = c.part
+		addEv("area_candidata", string.format("Candidata %s: %s (%s) | pontos %d | %s", c.ref, clean(part.Name), part.ClassName, c.score, table.concat(c.why, ", ")), c.ref, {
+			centro = p2(part.Position), tamanho = p2(part.Size), orientacao = p2(part.Orientation), dentro = c.inside,
+			touchInterest = c.touch, canCollide = part.CanCollide, canTouch = part.CanTouch, distancia = string.format("%.1f", c.dist),
+		})
+	end
+	if best then
+		addEv("resultado", string.format("Melhor candidata: %s em %s, tamanho %s, jogador %s", best.ref, p2(best.part.Position), p2(best.part.Size), best.inside and "DENTRO" or "FORA"), best.ref)
+	else
+		addEv("resultado", "Nenhuma peça candidata encontrada num raio de 14 studs.", nil)
+	end
+	addEv("sessao", "Detecção encerrada")
+
+	local inf = {}
+	if best then
+		inf[#inf + 1] = "[INFERIDO] " .. best.ref .. " (" .. clean(best.part.Name) .. ") é a candidata mais provável da área de entrega (" .. table.concat(best.why, ", ") .. "); não confirmado."
+		inf[#inf + 1] = "[INFERIDO] Para posicionar o personagem na área, o alvo seria o centro " .. p2(best.part.Position) .. " (altura dos pés = topo da peça); não confirmado."
+		if not best.inside then inf[#inf + 1] = "[INFERIDO] O jogador estava FORA da melhor candidata: repita o toque em pé no meio da área marcada." end
+	else
+		inf[1] = "[INDISPONÍVEL] Nenhuma hipótese pôde ser formulada: nenhuma peça candidata perto do jogador."
+	end
+	local completude = "insuficiente"
+	if best then
+		completude = (best.inside and (best.touch or best.nameHit or not best.part.CanCollide)) and "completo" or "parcial"
+	end
+	local now = os.time()
+	local rec = {
+		id = os.date("%Y%m%d-%H%M%S") .. "-" .. HttpService:GenerateGUID(false):sub(1, 4), categoria = "entregar_caixa",
+		startedAt = now, endedAt = now, duracao = 0, eventos = ev, objetos = objetos, antes = antes, depois = snapshot(), missao = missao,
+		executor = executorName(), placeId = game.PlaceId, falhas = {}, objetoPrincipal = best and best.ref or nil, diferencas = {},
+		inferencias = inf, completude = completude,
+		estado = string.format("%d candidata(s); melhor: %s.", #cand, best and best.ref or "nenhuma"),
+		limitacoes = {
+			"Detecção de ponto único: usa apenas a posição do jogador no instante do toque. Fique DENTRO da área marcada.",
+			"A validação real da entrega ocorre no servidor; o cliente só enxerga peças replicadas.",
+			"Se a área for um Decal/Texture, UI ou zona calculada só no servidor, pode não aparecer como peça candidata.",
+			"Raio de busca: 14 studs; peças maiores que 250 studs sem TouchInterest são ignoradas (ex.: chão do mapa).",
+		},
+	}
+	return rec
+end
+
+----------------------------------------------------------------------
+-- [4b] AUTO FARM (lixo / grama / ambos) — teleporte + instant interact nativo
 -- Caminhos vistos no diagnóstico:
 -- Workspace.Map.Sistemas.Jobs["Recolher Lixo"].Lixos / .Lixeiras
--- Alvo: ~0.5s no lixo e ~0.5s na lixeira.
+-- Workspace.Map.Sistemas.Jobs["Cortar Grama"].Gramas (prompt "Cortar [Requer Foice]", atributo Ativo)
+-- Alvo: ~0.5s por ação.
 ----------------------------------------------------------------------
-local Farm = { running = false, action = "parado", stats = { coletados = 0, depositados = 0 }, black = {} }
+local Farm = { running = false, kind = nil, t0 = 0, action = "parado", stats = { coletados = 0, depositados = 0, cortadas = 0 }, black = {} }
 do -- escopo do farm (reduz locals do chunk principal)
 local farmGen = 0
 local originalHold = {}
 local originalLOS = {}
 local farmMaid = newMaid()
 
-local function jobFolder()
+local function jobFolder(name)
 	local cur = Workspace
-	for _, n in ipairs({ "Map", "Sistemas", "Jobs", "Recolher Lixo" }) do
+	for _, n in ipairs({ "Map", "Sistemas", "Jobs", name }) do
 		cur = cur and cur:FindFirstChild(n)
 	end
 	return cur
@@ -838,14 +970,16 @@ local function farmRoot()
 	local c = LocalPlayer.Character
 	return c and c:FindFirstChild("HumanoidRootPart")
 end
-local function hasTrashTool()
+local function findTool(name)
 	local c = LocalPlayer.Character
-	local t = c and c:FindFirstChild("Lixo")
-	if t and t:IsA("Tool") then return true end
+	local t = c and c:FindFirstChild(name)
+	if t and t:IsA("Tool") then return t, true end
 	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
-	t = bp and bp:FindFirstChild("Lixo")
-	return t ~= nil and t:IsA("Tool")
+	t = bp and bp:FindFirstChild(name)
+	if t and t:IsA("Tool") then return t, false end
+	return nil, false
 end
+local function hasTrashTool() return findTool("Lixo") ~= nil end
 local function teleportTo(pos)
 	local hrp = farmRoot()
 	if not hrp or not pos then return false end
@@ -868,12 +1002,6 @@ end
 local function enableInstant(job)
 	for _, d in ipairs(job:GetDescendants()) do makeInstant(d) end
 	farmMaid:add(job.DescendantAdded:Connect(makeInstant))
-	-- prompts fora da pasta que ainda tenham hold: dispara na hora em que o hold começa
-	farmMaid:add(ProximityPromptService.PromptButtonHoldBegan:Connect(function(p)
-		if p.HoldDuration > 0 and type(fireproximityprompt) == "function" then
-			task.spawn(pcall, fireproximityprompt, p)
-		end
-	end))
 end
 -- Aciona sem bloquear o loop (fireproximityprompt de alguns executores yielda)
 local function triggerPrompt(p)
@@ -899,7 +1027,7 @@ local function waitFor(cond, timeout, alive)
 	end
 	return cond()
 end
-local function collectPrompts(job, folderName, trash)
+local function collectPrompts(job, folderName, needActive)
 	local out, now = {}, os.clock()
 	local folder = job:FindFirstChild(folderName)
 	if not folder then return out end
@@ -907,7 +1035,7 @@ local function collectPrompts(job, folderName, trash)
 		if d:IsA("ProximityPrompt") and d.Enabled then
 			local part, bl = d.Parent, Farm.black[d]
 			if not (bl and bl > now) and part and part:IsA("BasePart") then
-				if not trash or (part:GetAttribute("Ativo") ~= false and part.Transparency < 1) then
+				if not needActive or (part:GetAttribute("Ativo") ~= false and part.Transparency < 1) then
 					out[#out + 1] = d
 				end
 			end
@@ -938,11 +1066,8 @@ function Farm.stop()
 	farmMaid:clean()
 	Farm.restoreHold()
 end
-local function farmStep(gen)
-	local function alive() return Farm.running and farmGen == gen end
-	local job, hrp = jobFolder(), farmRoot()
-	if not job then Farm.action = "trabalho não encontrado no mapa"; task.wait(1) return end
-	if not hrp then Farm.action = "aguardando personagem"; task.wait(0.5) return end
+
+local function trashStep(job, hrp, alive)
 	if hasTrashTool() then
 		local bin = nearest(collectPrompts(job, "Lixeiras", false), hrp.Position)
 		if not bin then Farm.action = "sem lixeira disponível"; task.wait(0.5) return end
@@ -971,19 +1096,81 @@ local function farmStep(gen)
 		if done then Farm.stats.coletados += 1 else Farm.black[pr] = os.clock() + 5 end
 	end
 end
-function Farm.start()
+
+-- retorna false quando não há foice (para o modo "ambos" cair no lixo)
+local function grassStep(job, hrp, alive)
+	local tool, equipped = findTool("Foice")
+	if not tool then
+		Farm.action = "sem foice (compre em 'Comprar foice')"
+		return false
+	end
+	if not equipped then
+		Farm.action = "equipando foice"
+		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		if hum then pcall(function() hum:EquipTool(tool) end) end
+		task.wait(0.15)
+	end
+	local pr = nearest(collectPrompts(job, "Gramas", true), hrp.Position)
+	if not pr then Farm.action = "procurando grama ativa"; task.wait(0.5) return true end
+	Farm.action = "cortando grama"
+	teleportTo(posOf(pr))
+	task.wait(0.08)
+	triggerPrompt(pr)
+	local part = pr.Parent
+	local function cut()
+		return not pr:IsDescendantOf(Workspace) or part:GetAttribute("Ativo") == false or part.Transparency >= 1
+	end
+	local done = waitFor(cut, 0.3, alive)
+	if not done and alive() then
+		triggerFallback(pr)
+		done = waitFor(cut, 0.3, alive)
+	end
+	if done then Farm.stats.cortadas += 1 else Farm.black[pr] = os.clock() + 5 end
+	return true
+end
+
+local function farmStep(gen)
+	local function alive() return Farm.running and farmGen == gen end
+	local hrp = farmRoot()
+	if not hrp then Farm.action = "aguardando personagem"; task.wait(0.5) return end
+	local kind = Farm.kind
+	local jl = (kind == "lixo" or kind == "ambos") and jobFolder("Recolher Lixo") or nil
+	local jg = (kind == "grama" or kind == "ambos") and jobFolder("Cortar Grama") or nil
+	if (kind == "lixo" or kind == "ambos") and not jl then Farm.action = "trabalho de lixo não encontrado"; task.wait(1) return end
+	if (kind == "grama" or kind == "ambos") and not jg then Farm.action = "trabalho de grama não encontrado"; task.wait(1) return end
+	if kind == "lixo" then
+		trashStep(jl, hrp, alive)
+	elseif kind == "grama" then
+		if grassStep(jg, hrp, alive) == false then task.wait(1) end
+	else
+		-- ambos: alterna a cada 30s; se estiver carregando lixo, termina o depósito primeiro
+		local grassPhase = math.floor((os.clock() - Farm.t0) / 30) % 2 == 1
+		if hasTrashTool() or not grassPhase then
+			trashStep(jl, hrp, alive)
+		elseif grassStep(jg, hrp, alive) == false then
+			trashStep(jl, hrp, alive)
+		end
+	end
+end
+function Farm.start(kind)
 	if Farm.running then return false, "Farm já está ativo." end
 	if Recorder.active then return false, "Finalize a gravação antes de iniciar o farm." end
-	local job = jobFolder()
-	if not job then return false, "Pasta Workspace.Map.Sistemas.Jobs.Recolher Lixo não encontrada." end
+	kind = kind or "lixo"
+	local jl, jg = jobFolder("Recolher Lixo"), jobFolder("Cortar Grama")
+	if (kind == "lixo" or kind == "ambos") and not jl then return false, "Pasta Jobs.Recolher Lixo não encontrada." end
+	if (kind == "grama" or kind == "ambos") and not jg then return false, "Pasta Jobs.Cortar Grama não encontrada." end
+	if kind == "grama" and not findTool("Foice") then return false, "Você não tem a Foice. Compre antes (o farm não gasta dinheiro sozinho)." end
 	farmGen += 1
 	local gen = farmGen
 	Farm.running = true
-	Farm.stats = { coletados = 0, depositados = 0 }
+	Farm.kind = kind
+	Farm.t0 = os.clock()
+	Farm.stats = { coletados = 0, depositados = 0, cortadas = 0 }
 	Farm.black = {}
 	Farm.action = "iniciando"
 	farmMaid:clean()
-	enableInstant(job)
+	if jl and (kind == "lixo" or kind == "ambos") then enableInstant(jl) end
+	if jg and (kind == "grama" or kind == "ambos") then enableInstant(jg) end
 	task.spawn(function()
 		while Farm.running and farmGen == gen do
 			local ok, err = pcall(farmStep, gen)
@@ -1322,13 +1509,18 @@ end))
 -- Estado da UI
 local state = { mission = 1, tab = "rec" }
 local blocks = {}
-local renderCards, openDetail, refreshRecording, startFarmTicker
+local renderCards, openDetail, refreshRecording, startFarmTicker, saveFlow
 
 local function missionHasModule(id)
 	for _, m in ipairs(MISSIONS[state.mission].mods) do
 		if m == id then return true end
 	end
 	return false
+end
+local function missionKind()
+	local l, g = missionHasModule("lixo"), missionHasModule("grama")
+	if l and g then return "ambos" elseif g then return "grama" elseif l then return "lixo" end
+	return nil
 end
 local function missionStatusText(m)
 	local avail, pend = {}, {}
@@ -1346,7 +1538,7 @@ end
 -- Reposiciona farmRow / status / abas / páginas conforme a missão
 local function relayout()
 	local y = 52
-	local showFarm = missionHasModule("lixo") or Farm.running
+	local showFarm = missionKind() ~= nil or Farm.running
 	farmRow.Visible = showFarm
 	if showFarm then
 		farmRow.Position = UDim2.fromOffset(12, y)
@@ -1413,7 +1605,9 @@ end))
 
 -- Botões Iniciar / Parar farm (abaixo do dropdown)
 local farmStartBtn = button(farmRow, "Iniciar farm", UDim2.new(0.5, -3, 1, 0), function()
-	local ok, msg = Farm.start()
+	local kind = missionKind()
+	if not kind then toast("Esta missão não tem farm.") return end
+	local ok, msg = Farm.start(kind)
 	if ok then toast("Farm iniciado.") startFarmTicker() else toast(msg) end
 	refreshRecording()
 end, Color3.fromRGB(34, 84, 56))
@@ -1441,8 +1635,23 @@ local function makeBlock(cat, title, desc)
 	blocks[cat] = { btn = btn, status = status, card = card }
 	return blocks[cat]
 end
-makeBlock("foice", "Comprar foice", "Registre a compra da foice para identificar a loja, o item recebido e as alterações de dinheiro.")
-makeBlock("grama", "Cortar grama", "Registre o corte da grama para identificar a ferramenta, os objetos de grama e as alterações.")
+makeBlock("pegar_caixa", "Pegar caixa", "Registre a coleta da caixa para identificar o local, o item recebido e as alterações observáveis.")
+
+-- Entregar caixa: botão de toque único (detecta a área marcada no chão onde você está)
+local zoneCard = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, pageRec)
+corner(zoneCard, 10); stroke(zoneCard); pad(zoneCard, 9, 9); vlist(zoneCard, 5)
+label(zoneCard, "Entregar caixa", 13, C.text, true)
+label(zoneCard, "Fique DENTRO da área marcada no chão e toque uma vez. Lê a peça sob você e salva posição, tamanho e orientação exatos no Diagnóstico.", 10, C.muted)
+local zoneStatus = label(zoneCard, "Pronto.", 10, C.muted)
+button(zoneCard, "Detectar área (1 toque)", UDim2.new(1, 0, 0, 32), function()
+	local rec, err = detectDeliveryZone(MISSIONS[state.mission].label)
+	if not rec then toast(err) return end
+	local mo
+	for _, o in ipairs(rec.objetos) do if o.ref == rec.objetoPrincipal then mo = o end end
+	zoneStatus.Text = mo and ("Melhor: " .. mo.nome .. " • dados " .. rec.completude) or "Nenhuma peça candidata encontrada."
+	zoneStatus.TextColor3 = rec.completude == "completo" and C.green or C.amber
+	saveFlow(rec, "entregar_caixa")
+end, Color3.fromRGB(44, 74, 110))
 local storageLabel = label(pageRec, "", 9, C.muted)
 
 local function fmtClock(sec) return string.format("%02d:%02d", math.floor(sec / 60), math.floor(sec % 60)) end
@@ -1470,9 +1679,9 @@ refreshRecording = function()
 	end
 	relayout()
 	if Farm.running then
-		missionStatus.Text = string.format("● Farm ativo • coletados %d • depositados %d • %s", Farm.stats.coletados, Farm.stats.depositados, Farm.action)
+		missionStatus.Text = string.format("● Farm %s • lixo %d/%d • grama %d • %s", Farm.kind or "", Farm.stats.coletados, Farm.stats.depositados, Farm.stats.cortadas, Farm.action)
 		missionStatus.TextColor3 = C.green
-	elseif s and missionHasModule("lixo") then
+	elseif s and missionKind() then
 		missionStatus.Text = "Finalize a gravação para usar o farm."
 		missionStatus.TextColor3 = C.amber
 	else
@@ -1508,6 +1717,24 @@ startFarmTicker = function()
 	end)
 end
 
+saveFlow = function(rec, cat)
+	showModal({
+		title = "Nomear gravação", text = "Categoria: " .. CATS[cat].label .. " • " .. #rec.eventos .. " evento(s) • dados " .. rec.completude .. ".",
+		input = true, default = CATS[cat].label .. " " .. os.date("%H:%M:%S"), confirm = "Salvar",
+		onConfirm = function(name)
+			if rec.saved then return end
+			rec.saved = true
+			rec.nome = name
+			local okA, msg = Records.add(rec)
+			if not okA then rec.saved = false; rec.nome = nil; toast(msg); return end
+			renderCards()
+			refreshRecording()
+			toast("Salvo em Diagnóstico. " .. msg)
+		end,
+		onCancel = function() toast("Gravação descartada (não salva).") end,
+	})
+end
+
 local busy = false
 local function handleBlock(cat)
 	if busy then return end
@@ -1526,21 +1753,7 @@ local function handleBlock(cat)
 			local rec, e = Recorder.stop()
 			refreshRecording()
 			if not rec then toast(e) return end
-			showModal({
-				title = "Nomear gravação", text = "Categoria: " .. CATS[cat].label .. " • " .. #rec.eventos .. " evento(s) • dados " .. rec.completude .. ".",
-				input = true, default = CATS[cat].label .. " " .. os.date("%H:%M:%S"), confirm = "Salvar",
-				onConfirm = function(name)
-					if rec.saved then return end
-					rec.saved = true
-					rec.nome = name
-					local okA, msg = Records.add(rec)
-					if not okA then rec.saved = false; rec.nome = nil; toast(msg); return end
-					renderCards()
-					refreshRecording()
-					toast("Salvo em Diagnóstico. " .. msg)
-				end,
-				onCancel = function() toast("Gravação descartada (não salva).") end,
-			})
+			saveFlow(rec, cat)
 		else
 			toast("Outra gravação está ativa.")
 		end
@@ -1548,8 +1761,7 @@ local function handleBlock(cat)
 	busy = false
 	if not ok then toast("Erro: " .. trunc(err, 80)) end
 end
-blocks.foice.onClick = function() handleBlock("foice") end
-blocks.grama.onClick = function() handleBlock("grama") end
+blocks.pegar_caixa.onClick = function() handleBlock("pegar_caixa") end
 
 -- Detalhe do diagnóstico (overlay)
 local detail = mk("Frame", { Name = "Detail", Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 1, -HEADER_H), BackgroundColor3 = C.bg, BorderSizePixel = 0, Visible = false, ZIndex = 30, Active = true }, main)
