@@ -1,4 +1,4 @@
---[[ Auto Farm • Drip Menu — by Angel — ARQUIVO FINAL (com carregador seguro)
+--[[ Auto Farm • Drip Menu — by Angel — ARQUIVO FINAL v2 (com carregador seguro)
      Se algo falhar, o erro aparece numa caixa vermelha na tela E é copiado para a área de transferência.
      Os números de linha do erro se referem ao código interno (linha 1 = primeira linha após o início do bloco SRC). ]]
 
@@ -27,7 +27,7 @@ local SRC = [==[
 	- Observa apenas o que o cliente enxerga: personagem, mochila, leaderstats,
 	  ProximityPrompts, objetos próximos, cliques/toques, textos de UI e
 	  RemoteEvents servidor->cliente em ReplicatedStorage (somente tipos/prévia).
-	- NÃO intercepta chamadas cliente->servidor, não dispara remotes, não move o personagem.
+	- NÃO intercepta chamadas cliente->servidor, não dispara remotes, não move o personagem na gravação.
 	- Rótulos: [CAPTURADO] observado | [INFERIDO] hipótese | [INDISPONÍVEL] cliente não forneceu.
 ]]
 
@@ -65,13 +65,14 @@ local CHANGE = {
 	leaderstat = true, movimento_obj = true, propriedade = true, ui_texto = true, remote_servidor = true,
 }
 local PROPERTY_TYPES = { atributo = true, valor = true, leaderstat = true, propriedade = true, movimento_obj = true }
+-- coleta/deposito continuam aqui só para abrir registros antigos já salvos
 local CATS = {
 	coleta = { label = "Pegar lixo" }, deposito = { label = "Guardar lixo" },
 	foice = { label = "Comprar foice" }, grama = { label = "Cortar grama" },
 }
 local CAT_MOD = { coleta = "lixo", deposito = "lixo", foice = "grama", grama = "grama" }
 local MODULES = {
-	lixo = { label = "Lixo (pegar/guardar)", available = true },
+	lixo = { label = "Lixo (auto farm)", available = true },
 	grama = { label = "Grama (comprar foice/cortar)", available = true },
 	caixa = { label = "Caixa", available = false },
 }
@@ -500,7 +501,6 @@ local function pollSession(s)
 	end
 end
 
-local GuiService = game:GetService("GuiService")
 local function logUiClick(s, input, ownGui)
 	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 	if not pg then return end
@@ -735,8 +735,10 @@ local function finalize(s)
 			once("rem", id .. ": '" .. oname(e) .. "' deixou o personagem/mochila — compatível com depósito; não confirmado.")
 		elseif (e.tipo == "personagem_adic" or e.tipo == "mochila_adic") and rec.categoria == "foice" then
 			once("foice", id .. ": '" .. oname(e) .. "' passou a ficar com o personagem/mochila — compatível com compra da foice; não confirmado.")
+		elseif e.tipo == "ferramenta" and rec.categoria == "grama" then
+			once("tg", id .. ": " .. e.desc .. " — compatível com uso da foice no corte da grama; não confirmado.")
 		elseif e.tipo == "objeto_rem" or e.tipo == "removido" then
-			once("or", id .. ": " .. oname(e) .. " deixou de existir/foi removido no cliente — pode indicar consumo, depósito ou limpeza feita pelo servidor.")
+			once("or", id .. ": " .. oname(e) .. " deixou de existir/foi removido no cliente — pode indicar consumo, depósito, corte ou limpeza feita pelo servidor.")
 		elseif e.tipo == "objeto_adic" then
 			once("oa", id .. ": " .. oname(e) .. " apareceu perto do personagem — possível item gerado pelo jogo.")
 		elseif e.tipo == "leaderstat" then
@@ -813,15 +815,17 @@ function Recorder.abort()
 end
 
 ----------------------------------------------------------------------
--- [4b] AUTO FARM DE LIXO (teleporte + instant hold nativo)
--- Usa só caminhos vistos no diagnóstico:
+-- [4b] AUTO FARM DE LIXO (teleporte + instant interact nativo)
+-- Caminhos vistos no diagnóstico:
 -- Workspace.Map.Sistemas.Jobs["Recolher Lixo"].Lixos / .Lixeiras
+-- Alvo: ~0.5s no lixo e ~0.5s na lixeira.
 ----------------------------------------------------------------------
 local Farm = { running = false, action = "parado", stats = { coletados = 0, depositados = 0 }, black = {} }
 do -- escopo do farm (reduz locals do chunk principal)
 local farmGen = 0
 local originalHold = {}
-local FARM_STEP = 1 -- segundos antes de cada teleporte
+local originalLOS = {}
+local farmMaid = newMaid()
 
 local function jobFolder()
 	local cur = Workspace
@@ -844,22 +848,56 @@ local function hasTrashTool()
 end
 local function teleportTo(pos)
 	local hrp = farmRoot()
-	if not hrp then return false end
+	if not hrp or not pos then return false end
 	return pcall(function()
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
 	end)
 end
--- Instant hold: zera HoldDuration localmente (restaurado ao parar) e aciona o prompt
-local function triggerPrompt(p)
-	if originalHold[p] == nil then originalHold[p] = p.HoldDuration end
-	p.HoldDuration = 0
-	if type(fireproximityprompt) == "function" and pcall(fireproximityprompt, p) then return true end
-	return pcall(function()
-		p:InputHoldBegin()
-		task.wait(0.05)
-		p:InputHoldEnd()
+
+-- INSTANT INTERACT: HoldDuration = 0 e sem checagem de linha de visão (valores originais restaurados ao parar)
+local function makeInstant(p)
+	if typeof(p) ~= "Instance" or not p:IsA("ProximityPrompt") then return end
+	pcall(function()
+		if originalHold[p] == nil then originalHold[p] = p.HoldDuration end
+		if originalLOS[p] == nil then originalLOS[p] = p.RequiresLineOfSight end
+		p.HoldDuration = 0
+		p.RequiresLineOfSight = false
 	end)
+end
+local function enableInstant(job)
+	for _, d in ipairs(job:GetDescendants()) do makeInstant(d) end
+	farmMaid:add(job.DescendantAdded:Connect(makeInstant))
+	-- prompts fora da pasta que ainda tenham hold: dispara na hora em que o hold começa
+	farmMaid:add(ProximityPromptService.PromptButtonHoldBegan:Connect(function(p)
+		if p.HoldDuration > 0 and type(fireproximityprompt) == "function" then
+			task.spawn(pcall, fireproximityprompt, p)
+		end
+	end))
+end
+-- Aciona sem bloquear o loop (fireproximityprompt de alguns executores yielda)
+local function triggerPrompt(p)
+	makeInstant(p)
+	task.spawn(function()
+		if type(fireproximityprompt) == "function" then pcall(fireproximityprompt, p) end
+	end)
+end
+local function triggerFallback(p)
+	task.spawn(function()
+		pcall(function()
+			p:InputHoldBegin()
+			task.wait()
+			p:InputHoldEnd()
+		end)
+	end)
+end
+local function waitFor(cond, timeout, alive)
+	local t0 = os.clock()
+	while alive() and os.clock() - t0 < timeout do
+		if cond() then return true end
+		task.wait(0.03)
+	end
+	return cond()
 end
 local function collectPrompts(job, folderName, trash)
 	local out, now = {}, os.clock()
@@ -890,63 +928,68 @@ local function nearest(list, from)
 end
 function Farm.restoreHold()
 	for p, v in pairs(originalHold) do pcall(function() p.HoldDuration = v end) end
-	originalHold = {}
+	for p, v in pairs(originalLOS) do pcall(function() p.RequiresLineOfSight = v end) end
+	originalHold, originalLOS = {}, {}
 end
 function Farm.stop()
 	farmGen += 1
 	Farm.running = false
 	Farm.action = "parado"
+	farmMaid:clean()
 	Farm.restoreHold()
 end
 local function farmStep(gen)
 	local function alive() return Farm.running and farmGen == gen end
 	local job, hrp = jobFolder(), farmRoot()
 	if not job then Farm.action = "trabalho não encontrado no mapa"; task.wait(1) return end
-	if not hrp then Farm.action = "aguardando personagem"; task.wait(1) return end
+	if not hrp then Farm.action = "aguardando personagem"; task.wait(0.5) return end
 	if hasTrashTool() then
 		local bin = nearest(collectPrompts(job, "Lixeiras", false), hrp.Position)
-		if not bin then Farm.action = "sem lixeira disponível"; task.wait(1) return end
-		Farm.action = "indo à lixeira"
-		task.wait(FARM_STEP)
-		if not alive() then return end
-		teleportTo(posOf(bin))
-		task.wait(0.15)
+		if not bin then Farm.action = "sem lixeira disponível"; task.wait(0.5) return end
 		Farm.action = "depositando"
+		teleportTo(posOf(bin))
+		task.wait(0.08)
 		triggerPrompt(bin)
-		local t0 = os.clock()
-		while alive() and hasTrashTool() and os.clock() - t0 < 3 do task.wait(0.1) end
-		if not hasTrashTool() then Farm.stats.depositados += 1 else Farm.black[bin] = os.clock() + 10 end
+		local done = waitFor(function() return not hasTrashTool() end, 0.25, alive)
+		if not done and alive() then
+			triggerFallback(bin)
+			done = waitFor(function() return not hasTrashTool() end, 0.3, alive)
+		end
+		if done then Farm.stats.depositados += 1 else Farm.black[bin] = os.clock() + 2 end
 	else
 		local pr = nearest(collectPrompts(job, "Lixos", true), hrp.Position)
-		if not pr then Farm.action = "procurando lixo ativo"; task.wait(1) return end
-		Farm.action = "indo ao lixo"
-		task.wait(FARM_STEP)
-		if not alive() then return end
-		teleportTo(posOf(pr))
-		task.wait(0.15)
+		if not pr then Farm.action = "procurando lixo ativo"; task.wait(0.5) return end
 		Farm.action = "coletando"
+		teleportTo(posOf(pr))
+		task.wait(0.08)
 		triggerPrompt(pr)
-		local t0 = os.clock()
-		while alive() and not hasTrashTool() and os.clock() - t0 < 3 do task.wait(0.1) end
-		if hasTrashTool() then Farm.stats.coletados += 1 else Farm.black[pr] = os.clock() + 15 end
+		local done = waitFor(hasTrashTool, 0.25, alive)
+		if not done and alive() then
+			triggerFallback(pr)
+			done = waitFor(hasTrashTool, 0.3, alive)
+		end
+		if done then Farm.stats.coletados += 1 else Farm.black[pr] = os.clock() + 5 end
 	end
 end
 function Farm.start()
 	if Farm.running then return false, "Farm já está ativo." end
 	if Recorder.active then return false, "Finalize a gravação antes de iniciar o farm." end
-	if not jobFolder() then return false, "Pasta Workspace.Map.Sistemas.Jobs.Recolher Lixo não encontrada." end
+	local job = jobFolder()
+	if not job then return false, "Pasta Workspace.Map.Sistemas.Jobs.Recolher Lixo não encontrada." end
 	farmGen += 1
 	local gen = farmGen
 	Farm.running = true
 	Farm.stats = { coletados = 0, depositados = 0 }
 	Farm.black = {}
 	Farm.action = "iniciando"
+	farmMaid:clean()
+	enableInstant(job)
 	task.spawn(function()
 		while Farm.running and farmGen == gen do
 			local ok, err = pcall(farmStep, gen)
 			if not ok then Farm.action = "erro: " .. trunc(err, 60); task.wait(1) end
+			task.wait()
 		end
-		if not Farm.running then Farm.restoreHold() end
 	end)
 	return true
 end
@@ -1088,7 +1131,7 @@ end
 local function button(parent, text, size, onClick, color)
 	local b = mk("TextButton", {
 		Size = size, BackgroundColor3 = color or C.btn, AutoButtonColor = false, Text = text, TextColor3 = C.text,
-		TextSize = 12, Font = Enum.Font.GothamMedium, BorderSizePixel = 0,
+		TextSize = 11, Font = Enum.Font.GothamMedium, BorderSizePixel = 0,
 	}, parent)
 	corner(b, 7); stroke(b, C.stroke, 1)
 	if onClick then
@@ -1118,8 +1161,8 @@ local gui = mk("ScreenGui", { Name = "DripMenu" .. math.random(10000, 99999), Re
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999 }, getGuiParent())
 
 local VIEW = viewport()
-local W = math.min(330, math.max(260, VIEW.X - 16))
-local H = math.clamp(VIEW.Y - 30, 300, 470)
+local W = math.min(260, math.max(230, VIEW.X - 16))
+local H = math.clamp(VIEW.Y - 30, 260, 340)
 local main = mk("Frame", { Name = "Main", Size = UDim2.fromOffset(W, H), Position = UDim2.fromOffset(math.max(8, (VIEW.X - W) / 2), 12),
 	BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true }, gui)
 corner(main, 12); stroke(main, C.stroke, 1)
@@ -1134,16 +1177,16 @@ local shimTween = TweenService:Create(shimLine, TweenInfo.new(5, Enum.EasingStyl
 shimTween:Play()
 
 -- Cabeçalho
-local header = mk("Frame", { Name = "Header", Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 }, main)
-mk("TextLabel", { Position = UDim2.fromOffset(12, 5), Size = UDim2.new(1, -90, 0, 20), BackgroundTransparency = 1, Text = "Auto farm • drip menu",
-	TextColor3 = C.text, TextSize = 15, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left }, header)
-mk("TextLabel", { Position = UDim2.fromOffset(12, 26), Size = UDim2.new(1, -90, 0, 12), BackgroundTransparency = 1, Text = "by angel",
-	TextColor3 = C.muted, TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left }, header)
+local header = mk("Frame", { Name = "Header", Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1 }, main)
+mk("TextLabel", { Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -90, 0, 18), BackgroundTransparency = 1, Text = "Auto farm • drip menu",
+	TextColor3 = C.text, TextSize = 13, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left }, header)
+mk("TextLabel", { Position = UDim2.fromOffset(12, 23), Size = UDim2.new(1, -90, 0, 12), BackgroundTransparency = 1, Text = "by angel",
+	TextColor3 = C.muted, TextSize = 9, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left }, header)
 mk("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.stroke, BorderSizePixel = 0 }, header)
-local recDot = mk("Frame", { Position = UDim2.new(1, -58, 0, 18), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.red, BorderSizePixel = 0, Visible = false }, header)
+local recDot = mk("Frame", { Position = UDim2.new(1, -52, 0, 16), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.red, BorderSizePixel = 0, Visible = false }, header)
 corner(recDot, 4)
-local minBtn = mk("TextButton", { Position = UDim2.new(1, -38, 0, 8), Size = UDim2.fromOffset(28, 28), BackgroundColor3 = C.btn, AutoButtonColor = false,
-	Text = "–", TextColor3 = C.text, TextSize = 16, Font = Enum.Font.GothamBold, BorderSizePixel = 0 }, header)
+local minBtn = mk("TextButton", { Position = UDim2.new(1, -34, 0, 6), Size = UDim2.fromOffset(26, 26), BackgroundColor3 = C.btn, AutoButtonColor = false,
+	Text = "–", TextColor3 = C.text, TextSize = 15, Font = Enum.Font.GothamBold, BorderSizePixel = 0 }, header)
 corner(minBtn, 7); stroke(minBtn)
 
 -- Arraste (apenas pelo cabeçalho)
@@ -1168,50 +1211,54 @@ uiMaid:add(UserInputService.InputChanged:Connect(function(input)
 		local d = input.Position - dragStart
 		local v = viewport()
 		local nx = math.clamp(startPos.X.Offset + d.X, -W + 70, v.X - 70)
-		local ny = math.clamp(startPos.Y.Offset + d.Y, 0, v.Y - 44)
+		local ny = math.clamp(startPos.Y.Offset + d.Y, 0, v.Y - 40)
 		main.Position = UDim2.fromOffset(nx, ny)
 	end
 end))
 
 -- Corpo
-local body = mk("Frame", { Name = "Body", Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44), BackgroundTransparency = 1 }, main)
-mk("TextLabel", { Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -24, 0, 16), BackgroundTransparency = 1, Text = "Qual sua missão?",
-	TextColor3 = C.muted, TextSize = 11, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, body)
-local selector = mk("TextButton", { Position = UDim2.fromOffset(12, 22), Size = UDim2.new(1, -24, 0, 34), BackgroundColor3 = C.card, AutoButtonColor = false,
+local HEADER_H = 40
+local body = mk("Frame", { Name = "Body", Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 1, -HEADER_H), BackgroundTransparency = 1 }, main)
+mk("TextLabel", { Position = UDim2.fromOffset(12, 2), Size = UDim2.new(1, -24, 0, 14), BackgroundTransparency = 1, Text = "Qual sua missão?",
+	TextColor3 = C.muted, TextSize = 10, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, body)
+local selector = mk("TextButton", { Position = UDim2.fromOffset(12, 18), Size = UDim2.new(1, -24, 0, 30), BackgroundColor3 = C.card, AutoButtonColor = false,
 	Text = "", BorderSizePixel = 0 }, body)
 corner(selector, 8); stroke(selector)
 local selText = mk("TextLabel", { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -36, 1, 0), BackgroundTransparency = 1, Text = "",
-	TextColor3 = C.text, TextSize = 13, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, selector)
-mk("TextLabel", { Position = UDim2.new(1, -26, 0, 0), Size = UDim2.fromOffset(20, 34), BackgroundTransparency = 1, Text = "▼", TextColor3 = C.accent, TextSize = 10, Font = Enum.Font.Gotham }, selector)
-local missionStatus = mk("TextLabel", { Position = UDim2.fromOffset(12, 60), Size = UDim2.new(1, -24, 0, 40), BackgroundTransparency = 1, Text = "",
-	TextColor3 = C.muted, TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true }, body)
+	TextColor3 = C.text, TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, selector)
+mk("TextLabel", { Position = UDim2.new(1, -26, 0, 0), Size = UDim2.fromOffset(20, 30), BackgroundTransparency = 1, Text = "▼", TextColor3 = C.accent, TextSize = 9, Font = Enum.Font.Gotham }, selector)
 
-local tabRec = button(body, "Gravação", UDim2.new(0.5, -15, 0, 30), nil)
-tabRec.Position = UDim2.fromOffset(12, 104)
-local tabDiag = button(body, "Diagnóstico", UDim2.new(0.5, -15, 0, 30), nil)
-tabDiag.Position = UDim2.new(0.5, 3, 0, 104)
+-- Botões de farm (logo abaixo do dropdown; só aparecem com "lixo" na missão)
+local farmRow = mk("Frame", { Position = UDim2.fromOffset(12, 52), Size = UDim2.new(1, -24, 0, 28), BackgroundTransparency = 1, Visible = false }, body)
+local missionStatus = mk("TextLabel", { Position = UDim2.fromOffset(12, 84), Size = UDim2.new(1, -24, 0, 34), BackgroundTransparency = 1, Text = "",
+	TextColor3 = C.muted, TextSize = 9, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true }, body)
+
+local tabRec = button(body, "Gravação", UDim2.new(0.5, -15, 0, 26), nil)
+tabRec.Position = UDim2.fromOffset(12, 120)
+local tabDiag = button(body, "Diagnóstico", UDim2.new(0.5, -15, 0, 26), nil)
+tabDiag.Position = UDim2.new(0.5, 3, 0, 120)
 
 local function makePage()
-	local p = mk("ScrollingFrame", { Position = UDim2.fromOffset(0, 142), Size = UDim2.new(1, 0, 1, -142), BackgroundTransparency = 1, BorderSizePixel = 0,
+	local p = mk("ScrollingFrame", { Position = UDim2.fromOffset(0, 152), Size = UDim2.new(1, 0, 1, -152), BackgroundTransparency = 1, BorderSizePixel = 0,
 		ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollingDirection = Enum.ScrollingDirection.Y }, body)
-	pad(p, 12, 4, 12, 12); vlist(p, 8)
+	pad(p, 10, 4, 10, 10); vlist(p, 6)
 	return p
 end
 local pageRec, pageDiag = makePage(), makePage()
 pageDiag.Visible = false
 
 -- Dropdown (irmão do corpo, ZIndex alto: nunca fica atrás de outros componentes)
-local list = mk("Frame", { Name = "MissionList", Position = UDim2.fromOffset(12, 44 + 22 + 36), Size = UDim2.new(1, -24, 0, 5 * 32 + 8),
+local list = mk("Frame", { Name = "MissionList", Position = UDim2.fromOffset(12, HEADER_H + 18 + 32), Size = UDim2.new(1, -24, 0, 5 * 28 + 8),
 	BackgroundColor3 = C.panel, BorderSizePixel = 0, Visible = false, ZIndex = 10 }, main)
 corner(list, 8); stroke(list, C.accent, 1)
 
 -- Toast
-local toastLabel = mk("TextLabel", { AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -10), Size = UDim2.fromOffset(0, 0),
-	AutomaticSize = Enum.AutomaticSize.XY, BackgroundColor3 = C.panel, Text = "", TextColor3 = C.text, TextSize = 11, Font = Enum.Font.GothamMedium,
+local toastLabel = mk("TextLabel", { AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -8), Size = UDim2.fromOffset(0, 0),
+	AutomaticSize = Enum.AutomaticSize.XY, BackgroundColor3 = C.panel, Text = "", TextColor3 = C.text, TextSize = 10, Font = Enum.Font.GothamMedium,
 	TextWrapped = true, Visible = false, ZIndex = 80, BorderSizePixel = 0 }, main)
-corner(toastLabel, 8); stroke(toastLabel, C.accent, 1); pad(toastLabel, 10, 6)
-mk("UISizeConstraint", { MaxSize = Vector2.new(W - 24, 120) }, toastLabel)
+corner(toastLabel, 8); stroke(toastLabel, C.accent, 1); pad(toastLabel, 8, 5)
+mk("UISizeConstraint", { MaxSize = Vector2.new(W - 20, 120) }, toastLabel)
 local toastToken = 0
 toast = function(msg)
 	toastToken += 1
@@ -1227,15 +1274,15 @@ end
 local modal = mk("Frame", { Name = "Modal", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35,
 	Visible = false, ZIndex = 60, Active = true, BorderSizePixel = 0 }, main)
 corner(modal, 12)
-local dlg = mk("Frame", { Position = UDim2.fromOffset(12, 56), Size = UDim2.new(1, -24, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, modal)
-corner(dlg, 10); stroke(dlg, C.accent, 1); pad(dlg, 12, 12); vlist(dlg, 8)
-local mTitle = label(dlg, "", 14, C.text, true)
-local mText = label(dlg, "", 11, C.muted)
-local mInput = mk("TextBox", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.bg, Text = "", PlaceholderText = "Nome da gravação", TextColor3 = C.text,
-	PlaceholderColor3 = C.muted, TextSize = 13, Font = Enum.Font.Gotham, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0 }, dlg)
+local dlg = mk("Frame", { Position = UDim2.fromOffset(10, 48), Size = UDim2.new(1, -20, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, modal)
+corner(dlg, 10); stroke(dlg, C.accent, 1); pad(dlg, 10, 10); vlist(dlg, 6)
+local mTitle = label(dlg, "", 13, C.text, true)
+local mText = label(dlg, "", 10, C.muted)
+local mInput = mk("TextBox", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.bg, Text = "", PlaceholderText = "Nome da gravação", TextColor3 = C.text,
+	PlaceholderColor3 = C.muted, TextSize = 12, Font = Enum.Font.Gotham, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0 }, dlg)
 corner(mInput, 7); stroke(mInput); pad(mInput, 8, 0)
 local mError = label(dlg, "", 10, C.red)
-local mRow = mk("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1 }, dlg)
+local mRow = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, dlg)
 local mCancel = button(mRow, "Cancelar", UDim2.new(0.5, -4, 1, 0), nil)
 local mOk = button(mRow, "Confirmar", UDim2.new(0.5, -4, 1, 0), nil, Color3.fromRGB(44, 74, 110))
 mOk.Position = UDim2.new(0.5, 4, 0, 0)
@@ -1290,29 +1337,49 @@ local function missionStatusText(m)
 		if mod.available then avail[#avail + 1] = mod.label else pend[#pend + 1] = mod.label end
 	end
 	local t = {}
-	t[#t + 1] = #avail > 0 and ("Disponível para diagnóstico: " .. table.concat(avail, ", ") .. ".") or "Nenhum módulo de gravação disponível para esta missão."
-	if #pend > 0 then t[#t + 1] = "Ainda sem diagnóstico: " .. table.concat(pend, ", ") .. "." end
-	t[#t + 1] = "Nada é executado sem você iniciar."
+	if #avail > 0 then t[#t + 1] = "Disponível: " .. table.concat(avail, ", ") .. "." end
+	if #pend > 0 then t[#t + 1] = "Em breve: " .. table.concat(pend, ", ") .. "." end
+	t[#t + 1] = "Nada roda sem você iniciar."
 	return table.concat(t, " ")
+end
+
+-- Reposiciona farmRow / status / abas / páginas conforme a missão
+local function relayout()
+	local y = 52
+	local showFarm = missionHasModule("lixo") or Farm.running
+	farmRow.Visible = showFarm
+	if showFarm then
+		farmRow.Position = UDim2.fromOffset(12, y)
+		y += 32
+	end
+	missionStatus.Position = UDim2.fromOffset(12, y)
+	y += 36
+	tabRec.Position = UDim2.fromOffset(12, y)
+	tabDiag.Position = UDim2.new(0.5, 3, 0, y)
+	y += 30
+	for _, p in ipairs({ pageRec, pageDiag }) do
+		p.Position = UDim2.fromOffset(0, y)
+		p.Size = UDim2.new(1, 0, 1, -y)
+	end
 end
 
 local optButtons = {}
 local function setMission(i)
 	state.mission = i
 	selText.Text = MISSIONS[i].label
-	missionStatus.Text = missionStatusText(MISSIONS[i])
 	for idx, o in ipairs(optButtons) do
 		o.btn.BackgroundColor3 = idx == i and Color3.fromRGB(34, 42, 56) or C.panel
 		o.dot.Visible = idx == i
 	end
+	relayout()
 	if refreshRecording then refreshRecording() end
 end
 for i, m in ipairs(MISSIONS) do
-	local b = mk("TextButton", { Position = UDim2.fromOffset(4, 4 + (i - 1) * 32), Size = UDim2.new(1, -8, 0, 30), BackgroundColor3 = C.panel, AutoButtonColor = false,
+	local b = mk("TextButton", { Position = UDim2.fromOffset(4, 4 + (i - 1) * 28), Size = UDim2.new(1, -8, 0, 26), BackgroundColor3 = C.panel, AutoButtonColor = false,
 		Text = "", BorderSizePixel = 0, ZIndex = 11 }, list)
 	corner(b, 6)
 	mk("TextLabel", { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -34, 1, 0), BackgroundTransparency = 1, Text = m.label, TextColor3 = C.text,
-		TextSize = 12, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12 }, b)
+		TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 12 }, b)
 	local dot = mk("Frame", { Position = UDim2.new(1, -20, 0.5, -3), Size = UDim2.fromOffset(6, 6), BackgroundColor3 = C.accent, BorderSizePixel = 0, ZIndex = 12, Visible = false }, b)
 	corner(dot, 3)
 	optButtons[i] = { btn = b, dot = dot }
@@ -1338,89 +1405,79 @@ uiMaid:add(minBtn.Activated:Connect(function()
 	minimized = not minimized
 	list.Visible = false
 	body.Visible = not minimized
-	main.Size = minimized and UDim2.fromOffset(W, 44) or UDim2.fromOffset(W, H)
+	main.Size = minimized and UDim2.fromOffset(W, HEADER_H) or UDim2.fromOffset(W, H)
 	minBtn.Text = minimized and "+" or "–"
 	if minimized then shimTween:Pause() else shimTween:Play() end
 	if refreshRecording then refreshRecording() end
 end))
 
--- Blocos de gravação
-local function makeBlock(cat, title, desc)
-	local card = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, pageRec)
-	corner(card, 10); stroke(card); pad(card, 10, 10); vlist(card, 6)
-	label(card, title, 14, C.text, true)
-	label(card, desc, 11, C.muted)
-	local status = label(card, "", 11, C.muted)
-	local btn
-	btn = button(card, "Gravar", UDim2.new(1, 0, 0, 38), function() blocks[cat].onClick() end)
-	btn.TextSize = 13
-	blocks[cat] = { btn = btn, status = status, card = card }
-	return blocks[cat]
-end
-makeBlock("coleta", "Pegar lixo", "Registre uma interação completa de coleta para analisar os objetos e os eventos envolvidos.")
-makeBlock("deposito", "Guardar lixo", "Registre a interação de depósito para identificar os objetos e as alterações observáveis durante a entrega.")
-
-local farmCard = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, pageRec)
-corner(farmCard, 10); stroke(farmCard); pad(farmCard, 10, 10); vlist(farmCard, 6)
-label(farmCard, "Auto farm • lixo", 14, C.text, true)
-label(farmCard, "Teleporta ao lixo, coleta com instant hold, teleporta à lixeira e repete. Use por sua conta e risco: pode violar as regras do jogo/Roblox.", 11, C.muted)
-local farmStatus = label(farmCard, "", 11, C.muted)
-local farmBtn = button(farmCard, "Iniciar farm", UDim2.new(1, 0, 0, 38), function()
+-- Botões Iniciar / Parar farm (abaixo do dropdown)
+local farmStartBtn = button(farmRow, "Iniciar farm", UDim2.new(0.5, -3, 1, 0), function()
+	local ok, msg = Farm.start()
+	if ok then toast("Farm iniciado.") startFarmTicker() else toast(msg) end
+	refreshRecording()
+end, Color3.fromRGB(34, 84, 56))
+local farmStopBtn = button(farmRow, "Parar farm", UDim2.new(0.5, -3, 1, 0), function()
 	if Farm.running then
 		Farm.stop()
 		toast("Farm parado.")
 	else
-		local ok, msg = Farm.start()
-		if ok then toast("Farm iniciado.") startFarmTicker() else toast(msg) end
+		toast("Farm não está ativo.")
 	end
 	refreshRecording()
-end)
-farmBtn.TextSize = 13
+end, Color3.fromRGB(110, 44, 48))
+farmStopBtn.Position = UDim2.new(0.5, 3, 0, 0)
 
-makeBlock("foice", "Comprar foice", "Registre a compra da foice para identificar a loja, o item recebido e as alterações observáveis de dinheiro.")
-makeBlock("grama", "Cortar grama", "Registre o corte da grama para identificar a ferramenta, os objetos de grama e as alterações observáveis.")
-local storageLabel = label(pageRec, "", 10, C.muted)
+-- Blocos de gravação (Comprar foice / Cortar grama) — sempre visíveis
+local function makeBlock(cat, title, desc)
+	local card = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, pageRec)
+	corner(card, 10); stroke(card); pad(card, 9, 9); vlist(card, 5)
+	label(card, title, 13, C.text, true)
+	label(card, desc, 10, C.muted)
+	local status = label(card, "", 10, C.muted)
+	local btn
+	btn = button(card, "Gravar", UDim2.new(1, 0, 0, 32), function() blocks[cat].onClick() end)
+	btn.TextSize = 12
+	blocks[cat] = { btn = btn, status = status, card = card }
+	return blocks[cat]
+end
+makeBlock("foice", "Comprar foice", "Registre a compra da foice para identificar a loja, o item recebido e as alterações de dinheiro.")
+makeBlock("grama", "Cortar grama", "Registre o corte da grama para identificar a ferramenta, os objetos de grama e as alterações.")
+local storageLabel = label(pageRec, "", 9, C.muted)
 
 local function fmtClock(sec) return string.format("%02d:%02d", math.floor(sec / 60), math.floor(sec % 60)) end
 refreshRecording = function()
 	local s = Recorder.active
 	recDot.Visible = s ~= nil or Farm.running
 	for cat, b in pairs(blocks) do
-		local has = missionHasModule(CAT_MOD[cat])
-		b.card.Visible = has
-		if has then
-			if s and s.cat == cat then
-				b.btn.Text = "Parar e salvar"; b.btn.BackgroundColor3 = Color3.fromRGB(110, 44, 48); b.btn.TextColor3 = C.text
-				b.status.Text = string.format("● Gravando %s • %d evento(s). Execute a ação manualmente no jogo.", fmtClock(os.clock() - s.t0), #s.events)
-				b.status.TextColor3 = C.red
-			elseif s then
-				b.btn.Text = "Indisponível"; b.btn.BackgroundColor3 = C.btn; b.btn.TextColor3 = C.muted
-				b.status.Text = "Outra gravação está ativa: " .. CATS[s.cat].label .. ". Finalize-a primeiro."
-				b.status.TextColor3 = C.amber
-			elseif Farm.running then
-				b.btn.Text = "Indisponível (farm ativo)"; b.btn.BackgroundColor3 = C.btn; b.btn.TextColor3 = C.muted
-				b.status.Text = "Pare o farm para gravar."
-				b.status.TextColor3 = C.amber
-			else
-				b.btn.Text = "Gravar"; b.btn.BackgroundColor3 = Color3.fromRGB(44, 74, 110); b.btn.TextColor3 = C.text
-				b.status.Text = "Pronto para gravar."
-				b.status.TextColor3 = C.muted
-			end
+		if s and s.cat == cat then
+			b.btn.Text = "Parar e salvar"; b.btn.BackgroundColor3 = Color3.fromRGB(110, 44, 48); b.btn.TextColor3 = C.text
+			b.status.Text = string.format("● Gravando %s • %d evento(s). Execute a ação manualmente no jogo.", fmtClock(os.clock() - s.t0), #s.events)
+			b.status.TextColor3 = C.red
+		elseif s then
+			b.btn.Text = "Indisponível"; b.btn.BackgroundColor3 = C.btn; b.btn.TextColor3 = C.muted
+			b.status.Text = "Outra gravação está ativa: " .. CATS[s.cat].label .. ". Finalize-a primeiro."
+			b.status.TextColor3 = C.amber
+		elseif Farm.running then
+			b.btn.Text = "Indisponível (farm ativo)"; b.btn.BackgroundColor3 = C.btn; b.btn.TextColor3 = C.muted
+			b.status.Text = "Pare o farm para gravar."
+			b.status.TextColor3 = C.amber
+		else
+			b.btn.Text = "Gravar"; b.btn.BackgroundColor3 = Color3.fromRGB(44, 74, 110); b.btn.TextColor3 = C.text
+			b.status.Text = "Pronto para gravar."
+			b.status.TextColor3 = C.muted
 		end
 	end
-	farmCard.Visible = missionHasModule("lixo") or Farm.running
+	relayout()
 	if Farm.running then
-		farmBtn.Text = "Parar farm"; farmBtn.BackgroundColor3 = Color3.fromRGB(110, 44, 48); farmBtn.TextColor3 = C.text
-		farmStatus.Text = string.format("● Farm ativo • coletados %d • depositados %d • %s", Farm.stats.coletados, Farm.stats.depositados, Farm.action)
-		farmStatus.TextColor3 = C.green
-	elseif s then
-		farmBtn.Text = "Indisponível (gravando)"; farmBtn.BackgroundColor3 = C.btn; farmBtn.TextColor3 = C.muted
-		farmStatus.Text = "Finalize a gravação para usar o farm."
-		farmStatus.TextColor3 = C.amber
+		missionStatus.Text = string.format("● Farm ativo • coletados %d • depositados %d • %s", Farm.stats.coletados, Farm.stats.depositados, Farm.action)
+		missionStatus.TextColor3 = C.green
+	elseif s and missionHasModule("lixo") then
+		missionStatus.Text = "Finalize a gravação para usar o farm."
+		missionStatus.TextColor3 = C.amber
 	else
-		farmBtn.Text = "Iniciar farm"; farmBtn.BackgroundColor3 = Color3.fromRGB(44, 74, 110); farmBtn.TextColor3 = C.text
-		farmStatus.Text = "Parado."
-		farmStatus.TextColor3 = C.muted
+		missionStatus.Text = missionStatusText(MISSIONS[state.mission])
+		missionStatus.TextColor3 = C.muted
 	end
 	local dot = Storage.state == "confirmed" and "✔ " or (Storage.state == "memory" or Storage.state == "failed") and "! " or ""
 	storageLabel.Text = "Armazenamento: " .. dot .. Storage.msg
@@ -1445,7 +1502,7 @@ startFarmTicker = function()
 	task.spawn(function()
 		while Farm.running and farmTick == my do
 			refreshRecording()
-			task.wait(0.5)
+			task.wait(0.25)
 		end
 		refreshRecording()
 	end)
@@ -1459,7 +1516,6 @@ local function handleBlock(cat)
 		local s = Recorder.active
 		if not s then
 			if Farm.running then toast("Pare o farm antes de gravar.") return end
-			if not missionHasModule(CAT_MOD[cat]) then toast("Esta missão não inclui esse módulo.") return end
 			local sess, e = Recorder.start(cat, MISSIONS[state.mission].label, gui)
 			if not sess then toast(e) return end
 			startTicker(sess)
@@ -1492,23 +1548,21 @@ local function handleBlock(cat)
 	busy = false
 	if not ok then toast("Erro: " .. trunc(err, 80)) end
 end
-blocks.coleta.onClick = function() handleBlock("coleta") end
-blocks.deposito.onClick = function() handleBlock("deposito") end
 blocks.foice.onClick = function() handleBlock("foice") end
 blocks.grama.onClick = function() handleBlock("grama") end
 
 -- Detalhe do diagnóstico (overlay)
-local detail = mk("Frame", { Name = "Detail", Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44), BackgroundColor3 = C.bg, BorderSizePixel = 0, Visible = false, ZIndex = 30, Active = true }, main)
+local detail = mk("Frame", { Name = "Detail", Position = UDim2.fromOffset(0, HEADER_H), Size = UDim2.new(1, 0, 1, -HEADER_H), BackgroundColor3 = C.bg, BorderSizePixel = 0, Visible = false, ZIndex = 30, Active = true }, main)
 corner(detail, 12)
-local dBack = button(detail, "‹ Voltar", UDim2.fromOffset(70, 28), function() detail.Visible = false end)
-dBack.Position = UDim2.fromOffset(12, 8)
-local dTitle = mk("TextLabel", { Position = UDim2.fromOffset(88, 8), Size = UDim2.new(1, -100, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = C.muted,
-	TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, detail)
-local dName = mk("TextBox", { Position = UDim2.fromOffset(12, 42), Size = UDim2.new(1, -104, 0, 28), BackgroundColor3 = C.card, Text = "", TextColor3 = C.text, TextSize = 12,
+local dBack = button(detail, "‹ Voltar", UDim2.fromOffset(62, 26), function() detail.Visible = false end)
+dBack.Position = UDim2.fromOffset(10, 6)
+local dTitle = mk("TextLabel", { Position = UDim2.fromOffset(78, 6), Size = UDim2.new(1, -88, 0, 26), BackgroundTransparency = 1, Text = "", TextColor3 = C.muted,
+	TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, detail)
+local dName = mk("TextBox", { Position = UDim2.fromOffset(10, 38), Size = UDim2.new(1, -90, 0, 26), BackgroundColor3 = C.card, Text = "", TextColor3 = C.text, TextSize = 11,
 	Font = Enum.Font.Gotham, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0 }, detail)
 corner(dName, 7); stroke(dName); pad(dName, 8, 0)
 local detailRec
-local dRename = button(detail, "Renomear", UDim2.fromOffset(76, 28), function()
+local dRename = button(detail, "Renomear", UDim2.fromOffset(66, 26), function()
 	if not detailRec then return end
 	local name = dName.Text:gsub("^%s+", ""):gsub("%s+$", "")
 	if name == "" then toast("Digite um nome.") return end
@@ -1519,16 +1573,16 @@ local dRename = button(detail, "Renomear", UDim2.fromOffset(76, 28), function()
 	renderCards()
 	toast("Renomeado. " .. msg)
 end)
-dRename.Position = UDim2.new(1, -88, 0, 42)
-local dScroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(0, 78), Size = UDim2.new(1, 0, 1, -78), BackgroundTransparency = 1, BorderSizePixel = 0,
+dRename.Position = UDim2.new(1, -76, 0, 38)
+local dScroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(0, 72), Size = UDim2.new(1, 0, 1, -72), BackgroundTransparency = 1, BorderSizePixel = 0,
 	ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y }, detail)
-pad(dScroll, 12, 4, 12, 12); vlist(dScroll, 6)
+pad(dScroll, 10, 4, 10, 10); vlist(dScroll, 5)
 
 local function addTextChunks(parent, lines)
 	local buf, size, total, omitted = {}, 0, 0, 0
 	local function flush()
 		if #buf > 0 then
-			local l = label(parent, table.concat(buf, "\n"), 11, C.text)
+			local l = label(parent, table.concat(buf, "\n"), 10, C.text)
 			l.TextSelectable = true
 			buf, size = {}, 0
 		end
@@ -1548,8 +1602,8 @@ end
 local function buildSection(parent, title, fill)
 	local wrap = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, parent)
 	corner(wrap, 8); vlist(wrap, 0)
-	local head = mk("TextButton", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, AutoButtonColor = false, Text = "+  " .. title, TextColor3 = C.text,
-		TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, wrap)
+	local head = mk("TextButton", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, AutoButtonColor = false, Text = "+  " .. title, TextColor3 = C.text,
+		TextSize = 11, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, wrap)
 	pad(head, 10, 0)
 	local content = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = false }, wrap)
 	pad(content, 10, 4, 10, 10); vlist(content, 4)
@@ -1578,8 +1632,8 @@ openDetail = function(rec)
 		buildSection(dScroll, sec.title, function(content) addTextChunks(content, sec.lines) end)
 	end
 	buildSection(dScroll, "11. Relatório técnico copiável", function(content)
-		label(content, "O relatório completo (seções 1 a 10) é copiado em texto legível, sem depender de capturas de tela.", 11, C.muted)
-		button(content, "Copiar relatório completo", UDim2.new(1, 0, 0, 32), function()
+		label(content, "O relatório completo (seções 1 a 10) é copiado em texto legível, sem depender de capturas de tela.", 10, C.muted)
+		button(content, "Copiar relatório completo", UDim2.new(1, 0, 0, 30), function()
 			if copyText(fullReport(rec)) then toast("Relatório copiado.") else toast("Este executor não oferece setclipboard.") end
 		end)
 	end)
@@ -1588,7 +1642,7 @@ openDetail = function(rec)
 end
 
 -- Diagnóstico: cartões
-local emptyLabel = label(pageDiag, "Nenhuma gravação salva ainda. Grave uma interação na aba Gravação.", 11, C.muted)
+local emptyLabel = label(pageDiag, "Nenhuma gravação salva ainda. Grave uma interação na aba Gravação.", 10, C.muted)
 emptyLabel.Name = "Empty"
 local compColor = { completo = C.green, parcial = C.amber, insuficiente = C.red }
 local compText = { completo = "Dados completos", parcial = "Dados parciais", insuficiente = "Dados insuficientes" }
@@ -1600,18 +1654,18 @@ renderCards = function()
 	emptyLabel.Visible = #Records.list == 0
 	for _, rec in ipairs(Records.list) do
 		local card = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0 }, pageDiag)
-		corner(card, 10); stroke(card); pad(card, 10, 10); vlist(card, 4)
-		label(card, rec.nome, 13, C.text, true)
-		label(card, CATS[rec.categoria].label .. " • " .. os.date("%d/%m %H:%M", rec.startedAt), 11, C.muted)
-		label(card, #rec.eventos .. " evento(s) • " .. rec.estado, 10, C.muted)
-		label(card, "● " .. compText[rec.completude], 11, compColor[rec.completude], true)
-		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, card)
+		corner(card, 10); stroke(card); pad(card, 9, 9); vlist(card, 4)
+		label(card, rec.nome, 12, C.text, true)
+		label(card, CATS[rec.categoria].label .. " • " .. os.date("%d/%m %H:%M", rec.startedAt), 10, C.muted)
+		label(card, #rec.eventos .. " evento(s) • " .. rec.estado, 9, C.muted)
+		label(card, "● " .. compText[rec.completude], 10, compColor[rec.completude], true)
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 }, card)
 		mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, row)
-		button(row, "Ver diagnóstico", UDim2.fromOffset(112, 30), function() openDetail(rec) end)
-		button(row, "Copiar", UDim2.fromOffset(66, 30), function()
+		button(row, "Diagnóstico", UDim2.new(0.4, -4, 0, 28), function() openDetail(rec) end)
+		button(row, "Copiar", UDim2.new(0.3, -4, 0, 28), function()
 			if copyText(fullReport(rec)) then toast("Relatório copiado.") else toast("Este executor não oferece setclipboard.") end
 		end)
-		button(row, "Excluir", UDim2.fromOffset(66, 30), function()
+		button(row, "Excluir", UDim2.new(0.3, -4, 0, 28), function()
 			showModal({
 				title = "Excluir gravação?", text = "'" .. rec.nome .. "' será removida. Outras gravações não serão afetadas.", confirm = "Excluir", danger = true,
 				onConfirm = function()
@@ -1633,6 +1687,7 @@ local function destroy()
 	pcall(Farm.stop)
 	pcall(Recorder.abort)
 	ticker += 1
+	farmTick += 1
 	pcall(function() shimTween:Cancel() end)
 	uiMaid:clean()
 	pcall(function() gui:Destroy() end)
