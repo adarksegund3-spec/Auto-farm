@@ -50,7 +50,7 @@ local CFG = {
 	DELIVERY = Vector3.new(440.63, 3.85, -223.15),
 	DELIVERY_OFFSETS = { Vector3.new(0, 0, 0), Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2) },
 	BOX_SKIP_SECS = 12,   -- no modo misto, quantos segundos pular a caixa quando ela está em cooldown
-	NOTICE_MAX = 1,       -- só 1 aviso: nos módulos únicos, por cooldown (zera quando a ação dá certo); em Ambos/Todos, 1 por farm
+	NOTICE_MAX = 1,       -- só 1 aviso por farm iniciado (Ambos/Todos contam como um só)
 	NOTICE_GAP = 6,       -- intervalo mínimo (s) entre dois avisos do mesmo tipo
 }
 local JOBS = { lixo = "Recolher Lixo", grama = "Cortar Grama", caixa = "Caixas" }
@@ -242,7 +242,7 @@ end
 
 ----------------------------------------------------------------------
 -- AVISO DE COOLDOWN (igual para lixo, grama e caixa)
--- No máximo NOTICE_MAX avisos por cooldown; o contador zera quando a ação do tipo dá certo.
+-- No máximo NOTICE_MAX aviso por farm iniciado; só volta a avisar depois de parar e iniciar de novo.
 ----------------------------------------------------------------------
 function Farm.notify(kind)
 	if not kind then return end
@@ -257,8 +257,8 @@ function Farm.notify(kind)
 	if Farm.onNotify then pcall(Farm.onNotify, kind) end
 end
 function Farm.resetNotify(kind)
-	if #Farm.mods > 1 then return end -- em Ambos/Todos o aviso aparece só 1 vez por farm
-	if kind then Farm.notified[kind] = nil end
+	-- não zera mais: cada bloco avisa só 1 vez até o farm ser parado (Farm.start limpa a lista)
+	return
 end
 function Farm.restoreHold()
 	for p, v in pairs(originalHold) do pcall(function() p.HoldDuration = v end) end
