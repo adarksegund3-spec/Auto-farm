@@ -50,7 +50,7 @@ local CFG = {
 	DELIVERY = Vector3.new(440.63, 3.85, -223.15),
 	DELIVERY_OFFSETS = { Vector3.new(0, 0, 0), Vector3.new(2, 0, 0), Vector3.new(-2, 0, 0), Vector3.new(0, 0, 2), Vector3.new(0, 0, -2) },
 	BOX_SKIP_SECS = 12,   -- no modo misto, quantos segundos pular a caixa quando ela está em cooldown
-	NOTICE_MAX = 2,       -- máx. de avisos de cooldown por cooldown (zera quando a ação dá certo)
+	NOTICE_MAX = 1,       -- só 1 aviso: nos módulos únicos, por cooldown (zera quando a ação dá certo); em Ambos/Todos, 1 por farm
 	NOTICE_GAP = 6,       -- intervalo mínimo (s) entre dois avisos do mesmo tipo
 }
 local JOBS = { lixo = "Recolher Lixo", grama = "Cortar Grama", caixa = "Caixas" }
@@ -246,8 +246,10 @@ end
 ----------------------------------------------------------------------
 function Farm.notify(kind)
 	if not kind then return end
-	local s = Farm.notified[kind]
-	if not s then s = { n = 0, t = -100 }; Farm.notified[kind] = s end
+	-- Ambos/Todos se comportam como um só: um único contador compartilhado
+	local key = (#Farm.mods > 1) and "_misto" or kind
+	local s = Farm.notified[key]
+	if not s then s = { n = 0, t = -100 }; Farm.notified[key] = s end
 	local now = os.clock()
 	if s.n >= CFG.NOTICE_MAX or now - s.t < CFG.NOTICE_GAP then return end
 	s.n += 1
@@ -255,6 +257,7 @@ function Farm.notify(kind)
 	if Farm.onNotify then pcall(Farm.onNotify, kind) end
 end
 function Farm.resetNotify(kind)
+	if #Farm.mods > 1 then return end -- em Ambos/Todos o aviso aparece só 1 vez por farm
 	if kind then Farm.notified[kind] = nil end
 end
 function Farm.restoreHold()
@@ -533,9 +536,10 @@ local function kindOfText(text)
 end
 local function onGameNotice(...)
 	Farm.lastNotifT = os.clock()
+	local args, count = { ... }, select("#", ...)
 	pcall(function()
 		local parts = {}
-		for _, a in ipairs({ ... }) do collectStrings(a, parts, 0) end
+		for i = 1, count do collectStrings(args[i], parts, 0) end
 		local text = table.concat(parts, " ")
 		for _, w in ipairs(COOLDOWN_WORDS) do
 			if text:find(w, 1, true) then
@@ -698,9 +702,9 @@ corner(list, 7); stroke(list, C.accent)
 
 -- Notificação de cooldown (preta com gradiente roxo; some em 5.5s) — igual para lixo, grama e caixa
 local NOTES = {
-	caixa = "A entrega de Caixa tem cooldown, então aguarde.",
-	lixo = "A coleta de lixo tem cooldown, então aguarde.",
-	grama = "O corte de grama tem cooldown, então aguarde.",
+	caixa = "Existe um cooldown para a entrega de Caixa, então tenha paciência :)",
+	lixo = "Existe um cooldown para a coleta de lixo, então tenha paciência :)",
+	grama = "Existe um cooldown para o corte de grama, então tenha paciência :)",
 }
 local notice = mk("Frame", { Name = "Notice", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -100), Size = UDim2.fromOffset(250, 58),
 	BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Visible = false, ZIndex = 100 }, gui)
